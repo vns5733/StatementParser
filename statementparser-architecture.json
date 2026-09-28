@@ -1,0 +1,589 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "StatementParser — Complete Flow Map",
+    "subtitle": "Ingestion · read · recategorize · rule cascade · export · cache invalidation",
+    "output": "statementparser-architecture.html",
+    "visual_preset": "blueprint",
+    "animation": "none",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1364,
+      1200
+    ],
+    "views": [
+      {
+        "id": "ingest",
+        "label": "Ingestion flows",
+        "focus": [
+          "mask",
+          "ingest",
+          "statements",
+          "loader",
+          "parser",
+          "catrules",
+          "db"
+        ],
+        "note": "Upload and load-sample share one identical pipeline."
+      },
+      {
+        "id": "read",
+        "label": "Read path",
+        "focus": [
+          "db",
+          "overrides",
+          "api",
+          "next",
+          "browser"
+        ],
+        "note": "Eleven GET endpoints all read one cached frame."
+      },
+      {
+        "id": "write",
+        "label": "Write and rules",
+        "focus": [
+          "rules",
+          "recat",
+          "cache",
+          "db",
+          "api"
+        ],
+        "note": "Recategorize and the rule cascade both invalidate the cache."
+      },
+      {
+        "id": "export",
+        "label": "Export path",
+        "focus": [
+          "export",
+          "api",
+          "next",
+          "browser"
+        ],
+        "note": "CSV streams the entire filtered set, not one page."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "mask",
+      "type": "external",
+      "label": "mask_statement.py",
+      "sublabel": "PII masking",
+      "pos": [
+        30,
+        60
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "ingest",
+      "type": "backend",
+      "label": "upload / load-sample",
+      "sublabel": "POST /api/transactions",
+      "pos": [
+        230,
+        60
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "statements",
+      "type": "external",
+      "label": "Bank Statement",
+      "sublabel": "xls xlsx csv pdf",
+      "pos": [
+        30,
+        190
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "loader",
+      "type": "backend",
+      "label": "loader.py",
+      "sublabel": "+ pdf_loader.py",
+      "tag": "pandas",
+      "pos": [
+        230,
+        190
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "parser",
+      "type": "backend",
+      "label": "narration_parser.py",
+      "sublabel": "9 parsed fields",
+      "pos": [
+        430,
+        190
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "catrules",
+      "type": "backend",
+      "label": "category_rules.py",
+      "sublabel": "broad + sub",
+      "pos": [
+        635,
+        190
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "db",
+      "type": "database",
+      "label": "MySQL",
+      "sublabel": "4 tables",
+      "tag": "pymysql",
+      "pos": [
+        630,
+        390
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "overrides",
+      "type": "backend",
+      "label": "db.py read-time",
+      "sublabel": "rules + rollup",
+      "pos": [
+        630,
+        570
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI routers",
+      "sublabel": ":8000",
+      "tag": "uvicorn",
+      "pos": [
+        840,
+        570
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "next",
+      "type": "frontend",
+      "label": "Next.js App Router",
+      "sublabel": "Recharts + SWR",
+      "pos": [
+        1030,
+        570
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "Analyst Browser",
+      "sublabel": "localhost:3000",
+      "pos": [
+        1210,
+        570
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "rules",
+      "type": "backend",
+      "label": "rules / cascade",
+      "sublabel": "POST /api/categories",
+      "pos": [
+        30,
+        880
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "recat",
+      "type": "backend",
+      "label": "recategorize",
+      "sublabel": "POST /api/transactions",
+      "pos": [
+        230,
+        880
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "export",
+      "type": "backend",
+      "label": "export CSV",
+      "sublabel": "GET /api/transactions",
+      "pos": [
+        1030,
+        880
+      ],
+      "size": [
+        150,
+        80
+      ]
+    },
+    {
+      "id": "cache",
+      "type": "cloud",
+      "label": "in-process cache",
+      "sublabel": "base + final + rules",
+      "pos": [
+        630,
+        1090
+      ],
+      "size": [
+        160,
+        72
+      ]
+    },
+    {
+      "id": "config",
+      "type": "security",
+      "label": "config.py / deps.py",
+      "sublabel": "env creds + engine",
+      "pos": [
+        840,
+        1090
+      ],
+      "size": [
+        150,
+        72
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Ingestion",
+      "wraps": [
+        "loader",
+        "parser",
+        "catrules"
+      ],
+      "pad": 16
+    },
+    {
+      "kind": "region",
+      "label": "FastAPI :8000",
+      "wraps": [
+        "overrides",
+        "api"
+      ],
+      "pad": 16
+    },
+    {
+      "kind": "region",
+      "label": "Next.js :3000",
+      "wraps": [
+        "next"
+      ],
+      "pad": 16
+    }
+  ],
+  "connections": [
+    {
+      "from": "mask",
+      "to": "statements",
+      "label": "masked/*.xls",
+      "variant": "dashed",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        105,
+        163
+      ]
+    },
+    {
+      "from": "ingest",
+      "to": "loader",
+      "label": "BytesIO / path",
+      "variant": "emphasis",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        305,
+        163
+      ]
+    },
+    {
+      "from": "statements",
+      "to": "loader",
+      "label": "parse",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        205,
+        300
+      ]
+    },
+    {
+      "from": "loader",
+      "to": "parser",
+      "label": "7 cols",
+      "route": "straight",
+      "labelAt": [
+        405,
+        300
+      ]
+    },
+    {
+      "from": "parser",
+      "to": "catrules",
+      "label": "classify",
+      "route": "straight",
+      "labelAt": [
+        605,
+        300
+      ]
+    },
+    {
+      "from": "catrules",
+      "to": "db",
+      "label": "INSERT IGNORE",
+      "variant": "emphasis",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        710,
+        332
+      ]
+    },
+    {
+      "from": "db",
+      "to": "overrides",
+      "label": "JOIN + rules",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        710,
+        522
+      ]
+    },
+    {
+      "from": "overrides",
+      "to": "api",
+      "label": "cached df",
+      "route": "straight",
+      "labelAt": [
+        815,
+        550
+      ]
+    },
+    {
+      "from": "api",
+      "to": "next",
+      "label": "REST/JSON",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        1010,
+        538
+      ]
+    },
+    {
+      "from": "next",
+      "to": "browser",
+      "label": "SWR",
+      "route": "straight",
+      "labelAt": [
+        1195,
+        550
+      ]
+    },
+    {
+      "from": "export",
+      "to": "next",
+      "label": "full-set CSV",
+      "variant": "emphasis",
+      "route": "straight",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        1105,
+        775
+      ]
+    },
+    {
+      "from": "recat",
+      "to": "db",
+      "label": "re-parse all rows",
+      "variant": "emphasis",
+      "route": "orthogonal-h",
+      "fromSide": "top",
+      "toSide": "left",
+      "via": [
+        [
+          305,
+          430
+        ],
+        [
+          630,
+          430
+        ]
+      ],
+      "labelAt": [
+        305,
+        660
+      ]
+    },
+    {
+      "from": "rules",
+      "to": "db",
+      "label": "category_rules upsert",
+      "variant": "emphasis",
+      "route": "orthogonal-h",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          105,
+          340
+        ],
+        [
+          650,
+          340
+        ],
+        [
+          710,
+          340
+        ]
+      ],
+      "labelAt": [
+        380,
+        318
+      ]
+    },
+    {
+      "from": "cache",
+      "to": "overrides",
+      "label": "memoized frame",
+      "variant": "dashed",
+      "route": "straight",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        710,
+        875
+      ]
+    },
+    {
+      "from": "config",
+      "to": "api",
+      "label": "env creds",
+      "variant": "security",
+      "route": "straight",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        915,
+        875
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Flow 1 - Ingestion (upload and load-sample)",
+      "items": [
+        "POST /api/transactions/upload reads the UploadFile into BytesIO, rejects any extension outside .xls .xlsx .csv .pdf",
+        "POST /api/transactions/load-sample resolves DEFAULT_STATEMENT_PATH then the newest file in masked/",
+        "Both then call load_and_clean_statement, parse_narrations_dataframe and store_data_in_db in that order",
+        "store_data_in_db calls init_db_tables then writes both frames with INSERT IGNORE, so re-imports never duplicate"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Flow 2 - Read path (11 GET endpoints)",
+      "items": [
+        "list, meta, kpis, timeline, monthly-category, category-breakdown, balance-trend, category-trend, export, health",
+        "All of them call get_all_transactions_with_details, which returns a copy of the cached final frame",
+        "_get_filtered_df applies year, month, txn type, category, sub-category, search, amount, direction and recurrence in Pandas",
+        "No SQL-level filtering exists, so each request re-reads the whole table and aggregates in memory"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Flow 3 - Recategorize",
+      "items": [
+        "POST /api/transactions/recategorize calls recategorize_all_narrations and returns old_counts plus new_counts",
+        "Every stored narration is re-parsed and narration_details is rebuilt with the current parser rules",
+        "category_rules rows are untouched and simply re-applied at read time, so user edits survive",
+        "The transaction cache is invalidated at the end, making the change visible on the next request"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Flow 4 - Category rules and cascade",
+      "items": [
+        "POST /api/categories/rules upserts rules; /rules/delete removes them by rule_type and rule_key",
+        "apply-cascade previews matches, then pins every excluded row with a synthetic txn rule at its current category AND leaf",
+        "Stale txn overrides on included rows are cleared so the broader merchant or narration rule takes effect",
+        "Only the rules cache and the final frame are invalidated; the stored transactions are never rewritten"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Flow 5 - Export",
+      "items": [
+        "GET /api/transactions/export reuses the same _get_filtered_df as the tables, so exports match the screen",
+        "Dates are normalised to %Y-%m-%d and the frame is encoded utf-8-sig so Excel opens it correctly",
+        "The filename comes from Content-Disposition and the whole filtered set streams, not the visible page"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "Cache contract and constraints",
+      "items": [
+        "_CACHE_LOCK makes a cold start single-flight, so 11 concurrent dashboard requests run one query",
+        "invalidate_transaction_cache drops base+final; invalidate_rules_cache drops rules+final; invalidate_caches drops both",
+        "Any write outside the API is invisible until restart; there is no test suite, requirements.txt or git repository"
+      ]
+    }
+  ]
+}

@@ -13,10 +13,15 @@ import {
 } from "recharts";
 import { MonthlyCategoryEntry } from "@/types";
 import { formatCurrency, formatCompactCurrency } from "@/lib/formatters";
+import { legendLabel, legendValue } from "@/lib/legend";
 
 interface CategoryStackChartProps {
   data: MonthlyCategoryEntry[];
   isLoading?: boolean;
+  /** Called with the category behind a clicked legend entry. */
+  onSelectSeries?: (category: string) => void;
+  /** Broad categories currently narrowing the view, for the active marker. */
+  selectedValues?: string[];
 }
 
 const PALETTE = [
@@ -26,9 +31,22 @@ const PALETTE = [
   "#3b82f6", "#22c55e", "#e11d48", "#7c3aed", "#0284c7"
 ];
 
+/**
+ * The pivot keys one series per category *per direction* — `Debit_Rent` and
+ * `Credit_Rent` are two bars of the same category. The legend therefore carries
+ * the direction in its key, and the category has to be recovered before it can
+ * become a filter, or clicking "Rent (-)" would look for a category called
+ * "Debit_Rent" and match nothing.
+ */
+function stripSeriesPrefix(series: string): string {
+  return series.replace(/^Debit_/, "").replace(/^Credit_/, "");
+}
+
 export default function CategoryStackChart({
   data,
   isLoading,
+  onSelectSeries,
+  selectedValues = [],
 }: CategoryStackChartProps) {
   // Extract distinct categories
   const categories = useMemo(() => {
@@ -95,7 +113,7 @@ export default function CategoryStackChart({
   };
 
   return (
-    <div className="glass-panel" style={{ padding: "20px", marginBottom: "24px" }}>
+    <div className="glass-panel" style={{ padding: "20px" }}>
       <div style={{ marginBottom: "16px" }}>
         <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--text-primary)" }}>
           Monthly Cash Flow by Broad Category
@@ -123,13 +141,18 @@ export default function CategoryStackChart({
               <Tooltip content={<CustomTooltip />} />
               <Legend
                 wrapperStyle={{ paddingTop: "12px", maxHeight: "60px", overflowY: "auto" }}
+                onClick={
+                  onSelectSeries
+                    ? (entry: any) => onSelectSeries(stripSeriesPrefix(legendValue(entry)))
+                    : undefined
+                }
                 formatter={(val: string) => {
-                  const name = val.replace("Debit_", "").replace("Credit_", "");
+                  const name = stripSeriesPrefix(val);
                   const isDebit = val.startsWith("Debit_");
-                  return (
-                    <span style={{ color: "var(--text-secondary)", fontSize: "0.75rem", marginRight: "8px" }}>
-                      {name} {isDebit ? "(-)" : "(+)"}
-                    </span>
+                  return legendLabel(
+                    val,
+                    `${name} ${isDebit ? "(-)" : "(+)"}`,
+                    selectedValues.includes(name)
                   );
                 }}
               />

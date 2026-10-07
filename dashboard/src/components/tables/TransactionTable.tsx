@@ -5,6 +5,9 @@ import { Filters, Transaction } from "@/types";
 import { downloadFilteredCSV } from "@/lib/api";
 import { useClampPage } from "@/hooks/useClampPage";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/formatters";
+import SortableHeader from "@/components/tables/SortableHeader";
+import NoteCell from "@/components/tables/NoteCell";
+import DirectionBadge from "@/components/tables/DirectionBadge";
 
 const CATEGORY_SELECT = {
   padding: "6px 10px",
@@ -49,6 +52,32 @@ interface TransactionTableProps {
   categories?: string[];
   /** Known leaves, for the sub-category dropdown. */
   subCategories?: string[];
+  /**
+   * Sort state. Supplying `onSortChange` turns the header row into sortable
+   * columns, which must be paired with `sortBy`/`sortOrder` fed back into the
+   * data hook - the rows here are one server-side page, so sorting them locally
+   * would only reorder that page rather than the whole result set.
+   */
+  sortBy?: string;
+  sortOrder?: "asc" | "desc";
+  onSortChange?: (col: string, order: "asc" | "desc") => void;
+  /**
+   * Persists a note against one transaction. Supplying this adds a Note column;
+   * omitting it leaves the column out entirely rather than showing an editor that
+   * throws its text away.
+   */
+  onNoteSave?: (chqRef: string, note: string | null) => void;
+  /**
+   * Multi-select. Supplying `selectedRefs` turns on the checkbox column and the
+   * bulk bar; `renderBulkActions` decides what those actions are.
+   *
+   * Selection lives in the parent rather than here, because a selection has to
+   * survive a page change and a refilter — holding it in this component would drop
+   * it every time the user paged, silently shrinking the set they were acting on.
+   */
+  selectedRefs?: string[];
+  onSelectionChange?: (refs: string[]) => void;
+  renderBulkActions?: (refs: string[]) => React.ReactNode;
 }
 
 export default function TransactionTable({
@@ -65,9 +94,42 @@ export default function TransactionTable({
   onCategoryChange,
   categories = [],
   subCategories = [],
+  sortBy = "",
+  sortOrder = "asc",
+  onSortChange,
+  onNoteSave,
+  selectedRefs,
+  onSelectionChange,
+  renderBulkActions,
 }: TransactionTableProps) {
   const [isExporting, setIsExporting] = useState(false);
   const totalPages = useClampPage(page, pageSize, total, onChangePage, isLoading);
+  // Short alias: the header row is long, and this keeps it readable.
+  const SH = !!onSortChange;
+  const sortProps = { sortBy, sortOrder, onSortChange: onSortChange! };
+
+  const selectable = !!onSelectionChange;
+  const selected = selectedRefs || [];
+  const selectedSet = new Set(selected);
+  const allOnPageSelected = data.length > 0 && data.every((r) => selectedSet.has(r.Chq_Ref_Number));
+
+  const toggleRow = (ref: string) => {
+    if (!onSelectionChange) return;
+    onSelectionChange(
+      selectedSet.has(ref) ? selected.filter((r) => r !== ref) : [...selected, ref]
+    );
+  };
+
+  const togglePage = () => {
+    if (!onSelectionChange) return;
+    if (allOnPageSelected) {
+      onSelectionChange(selected.filter((r) => !data.some((d) => d.Chq_Ref_Number === r)));
+    } else {
+      const next = new Set(selected);
+      data.forEach((r) => next.add(r.Chq_Ref_Number));
+      onSelectionChange(Array.from(next));
+    }
+  };
 
   // Export the entire filtered set from the server so the download is not
   // silently capped at the rows currently on screen.
@@ -104,6 +166,20 @@ export default function TransactionTable({
         </div>
 
         <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+          {selected.length > 0 && renderBulkActions ? (
+            <div className="bulk-bar">
+              <span className="bulk-count">{formatNumber(selected.length)} selected</span>
+              {renderBulkActions(selected)}
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => onSelectionChange?.([])}
+              >
+                Clear
+              </button>
+            </div>
+          ) : null}
+
           {exportFilters && (
             <button
               className="btn btn-secondary"
@@ -143,19 +219,84 @@ export default function TransactionTable({
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
             <thead>
               <tr style={{ borderBottom: "1px solid var(--border-subtle)", textAlign: "left" }}>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "110px" }}>Date</th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>Narration</th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>Type</th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "190px" }}>
-                  Category
-                </th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "95px" }}>
-                  Payee / Entity
-                </th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, textAlign: "right" }}>Debit (₹)</th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, textAlign: "right" }}>Credit (₹)</th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, textAlign: "right" }}>Balance (₹)</th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>Reference</th>
+                {selectable ? (
+                  <th style={{ padding: "10px 8px", width: "34px" }}>
+                    <input
+                      type="checkbox"
+                      checked={allOnPageSelected}
+                      onChange={togglePage}
+                      aria-label="Select every row on this page"
+                      title="Select every row on this page (selection carries across pages)"
+                    />
+                  </th>
+                ) : null}
+                {SH ? (
+                  <>
+                    <SortableHeader col="Date" label="Date" padding="10px 12px" {...sortProps} />
+                    <SortableHeader col="Narration" label="Narration" padding="10px 12px" {...sortProps} />
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>Type</th>
+                    <SortableHeader
+                      col="Broad_Category"
+                      label="Category"
+                      padding="10px 12px"
+                      {...sortProps}
+                    />
+                    <SortableHeader
+                      col="Payee_Receiver"
+                      label="Payee / Entity"
+                      padding="10px 12px"
+                      {...sortProps}
+                    />
+                    <SortableHeader
+                      col="Debit_Amount"
+                      label="Debit (₹)"
+                      align="right"
+                      padding="10px 12px"
+                      {...sortProps}
+                    />
+                    <SortableHeader
+                      col="Credit_Amount"
+                      label="Credit (₹)"
+                      align="right"
+                      padding="10px 12px"
+                      {...sortProps}
+                    />
+                    <th
+                      style={{
+                        padding: "10px 12px",
+                        color: "var(--text-muted)",
+                        fontWeight: 600,
+                        textAlign: "right",
+                      }}
+                    >
+                      Balance (₹)
+                    </th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>
+                      Reference
+                    </th>
+                  </>
+                ) : (
+                  <>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "110px" }}>Date</th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>Narration</th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>Type</th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "190px" }}>
+                      Category
+                    </th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "95px" }}>
+                      Payee / Entity
+                    </th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, textAlign: "right" }}>Debit (₹)</th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, textAlign: "right" }}>Credit (₹)</th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, textAlign: "right" }}>Balance (₹)</th>
+                    <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>Reference</th>
+                  </>
+                )}
+                {onNoteSave ? (
+                  <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "210px" }}>
+                    Note
+                  </th>
+                ) : null}
               </tr>
             </thead>
             <tbody>
@@ -168,7 +309,18 @@ export default function TransactionTable({
                   }}
                   onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255, 255, 255, 0.02)")}
                   onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                  className={selectedSet.has(row.Chq_Ref_Number) ? "row-selected" : undefined}
                 >
+                  {selectable ? (
+                    <td style={{ padding: "12px 8px" }}>
+                      <input
+                        type="checkbox"
+                        checked={selectedSet.has(row.Chq_Ref_Number)}
+                        onChange={() => toggleRow(row.Chq_Ref_Number)}
+                        aria-label={`Select transaction ${row.Chq_Ref_Number}`}
+                      />
+                    </td>
+                  ) : null}
                   <td style={{ padding: "12px", whiteSpace: "nowrap", color: "var(--text-secondary)" }}>
                     {formatDate(row.Date)}
                   </td>
@@ -265,7 +417,7 @@ export default function TransactionTable({
                         settlement badge is the reason the amount looks like spend
                         but is not counted as such. */}
                     <div
-                      style={{ display: "flex", gap: "4px", marginTop: "4px" }}
+                      style={{ display: "flex", gap: "4px", marginTop: "4px", alignItems: "center" }}
                     >
                       {row.Account_Source === "CREDIT_CARD" && (
                         <span
@@ -287,6 +439,12 @@ export default function TransactionTable({
                           Card bill payment
                         </span>
                       )}
+                      {/* What the direction reconciler did to this row — either
+                          moved it to its counterpart category, or flagged that the
+                          category and the amount side disagree. It sits beside the
+                          category rather than in its own column because it is only
+                          meaningful next to that category. */}
+                      <DirectionBadge row={row} compact />
                     </div>
                   </td>
                   <td style={{ padding: "12px", color: "var(--text-secondary)", maxWidth: "160px" }}>
@@ -369,6 +527,11 @@ export default function TransactionTable({
                   }}>
                     {row.Chq_Ref_Number}
                   </td>
+                  {onNoteSave ? (
+                    <td style={{ padding: "12px", maxWidth: "210px" }}>
+                      <NoteCell row={row} onSave={onNoteSave} />
+                    </td>
+                  ) : null}
                 </tr>
               ))}
             </tbody>

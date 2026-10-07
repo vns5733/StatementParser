@@ -1,8 +1,11 @@
 "use client";
 
 import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { useSWRConfig } from "swr";
 import Sidebar from "@/components/Sidebar";
+import DataTools from "@/components/DataTools";
 import KpiCards from "@/components/KpiCards";
+import CardTiles from "@/components/CardTiles";
 import TabNav, { TabId } from "@/components/TabNav";
 import TimelineChart from "@/components/charts/TimelineChart";
 import CategoryStackChart from "@/components/charts/CategoryStackChart";
@@ -27,15 +30,21 @@ import {
 } from "@/hooks/useTransactions";
 import { useCategories } from "@/hooks/useCategories";
 import { useCardStatements } from "@/hooks/useCards";
+import { useLLMStatus, useNoteActions } from "@/hooks/useNotes";
 import { Filters, GroupBy, GroupCol, Transaction } from "@/types";
 import { formatCurrency, formatNumber } from "@/lib/formatters";
 import CreditCardsPanel from "@/components/CreditCardsPanel";
+import InsightsPanel from "@/components/InsightsPanel";
 import DirectionModal, {
   PendingDirectionEdit,
 } from "@/components/modals/DirectionModal";
+import CascadeModal, { PendingEdit } from "@/components/modals/CascadeModal";
+import BulkEditModal from "@/components/modals/BulkEditModal";
+import SuggestModal from "@/components/modals/SuggestModal";
+import CategoryDefinitionsPanel from "@/components/CategoryDefinitionsPanel";
 
 export default function DashboardPage() {
-  const [activeTab, setActiveTab] = useState<TabId>("analytics");
+  const [activeTab, setActiveTab] = useState<TabId>("overview");
 
   // Filter state
   const [filters, setFilters] = useState<Filters>({
@@ -60,6 +69,10 @@ export default function DashboardPage() {
   // Table pagination state
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
+  // Explorer sort. Server-side, so a click re-ranks the whole result set; a new
+  // sort resets to page 1, because the page the user was on may no longer exist.
+  const [txSortBy, setTxSortBy] = useState("Date");
+  const [txSortOrder, setTxSortOrder] = useState<"asc" | "desc">("desc");
 
   // Chart view states
   const [groupBy, setGroupBy] = useState<GroupBy>("month");
@@ -67,7 +80,13 @@ export default function DashboardPage() {
   const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
   const [selectedCategoryMonth, setSelectedCategoryMonth] = useState<string | null>(null);
 
-  // Tab 3 state
+  // Transactions tab. "browse" is the row-level ledger (search, sort, export,
+  // and both per-row editors); "reassign" is the category-scoped workbench.
+  // Both answer the same question - "what is this row, and is it filed right?"
+  // - so they are two modes of one tab rather than two tabs.
+  const [txView, setTxView] = useState<"browse" | "reassign">("browse");
+
+  // Bulk-reassign state (the workbench half of the Transactions tab)
   const [selectedCategory, setSelectedCategory] = useState<string>("");
   // Leaf within the selected broad category; empty means "all leaves".
   const [selectedSubCategory, setSelectedSubCategory] = useState<string>("");
@@ -80,8 +99,35 @@ export default function DashboardPage() {
   const [editorSortBy, setEditorSortBy] = useState<string>("Date");
   const [editorSortOrder, setEditorSortOrder] = useState<"asc" | "desc">("asc");
 
-  // Data hooks
-  const { meta, mutate: mutateMeta } = useMeta();
+  // Category correction driven from the row-level table. Previously each table
+  // that showed transactions carried its own copy of this state and its own
+  // CascadeModal; one editor in one tab means the three cannot drift apart.
+  const [pendingEdits, setPendingEdits] = useState<PendingEdit[]>([]);
+  const [isCascadeOpen, setIsCascadeOpen] = useState(false);
+
+  const handleCategoryChange = useCallback(
+    (row: Transaction, newCategory: string, newSub?: string) => {
+      const sub = newSub === undefined ? row.Sub_Category : newSub;
+      if (newCategory === row.Broad_Category && sub === row.Sub_Category) return;
+      setPendingEdits([
+        {
+          chq_ref: row.Chq_Ref_Number,
+          payee: row.Payee_Receiver,
+          narration: row.Narration,
+          new_category: newCategory,
+          new_sub_category: sub,
+          old_category: row.Broad_Category,
+          old_sub_category: row.Sub_Category,
+        },
+      ]);
+      setIsCascadeOpen(true);
+    },
+    []
+  );
+
+  // Data hooks. These no longer destructure `mutate`: handleDataRefresh
+  // revalidates the whole /transactions and /cards keyspace through useSWRConfig.
+  const { meta } = useMeta();
   const {
     categories,
     customCategories,
@@ -93,8 +139,27 @@ export default function DashboardPage() {
     applyCascadeRule,
     previewDirection,
     applyDirectionCascade,
+    definitions,
+    upsertDefinition,
     mutate: mutateCategories,
   } = useCategories();
+
+  // Notes, and category suggestions from the local opencode server.
+  //
+  // The note writer is the only writer, and it revalidates the transaction
+  // keyspace itself — notes ride along on the row, so a save that did not
+  // invalidate would leave the cell showing the text it was rendered with, which
+  // reads as the save having failed.
+  const { writeNote, suggest } = useNoteActions();
+  const llmStatus = useLLMStatus();
+
+  // Bulk selection. Held here rather than inside TransactionTable because a
+  // selection has to survive a page change and a refilter; owned by the table it
+  // would silently shrink the moment the user paged.
+  const [selectedRefs, setSelectedRefs] = useState<string[]>([]);
+  const [bulkMode, setBulkMode] = useState<"category" | "note" | null>(null);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const [definitionsOpen, setDefinitionsOpen] = useState(false);
 
   // Debit/credit corrections. The modal lives here so every table that shows
   // transactions can offer the same flip control, and one refresh invalidates
@@ -176,7 +241,7 @@ export default function DashboardPage() {
   }, [selectedCategory, broadUnderParent]);
 
   // Fetch KPI metrics (global)
-  const { kpis, isLoading: kpisLoading, mutate: mutateKPIs } = useKPIs(filters, ready);
+  const { kpis, isLoading: kpisLoading } = useKPIs(filters, ready);
 
   // Statement count for the Credit Cards tab badge. SWR dedupes this against
   // the same request the panel makes, so it costs no extra round trip.
@@ -190,14 +255,34 @@ export default function DashboardPage() {
     broadCategories: selectedCategory ? [selectedCategory] : [],
     subCategories: selectedSubCategory ? [selectedSubCategory] : [],
   };
-  const { kpis: catKpiData, mutate: mutateCatKPIs } = useKPIs(catKpiFilters, ready);
+  const { kpis: catKpiData } = useKPIs(catKpiFilters, ready);
 
-  // Fetch paginated transactions (for Tab 2 Explorer)
-  const {
-    transactionsPage,
-    isLoading: txLoading,
-    mutate: mutateTransactions,
-  } = useTransactions(filters, page, pageSize, "", "asc", ready);
+  // Fetch paginated transactions (for Tab 2 Explorer). Sorting is server-side, so
+  // it is part of the query key rather than applied to the returned page.
+  const { transactionsPage, isLoading: txLoading } = useTransactions(
+    filters,
+    page,
+    pageSize,
+    txSortBy,
+    txSortOrder,
+    ready
+  );
+
+  // Resolves the ticked refs to displayable rows, for the bulk modals' preview.
+  //
+  // Only rows currently on screen can be resolved, so a selection that outlives a
+  // page change resolves to fewer rows than it contains. That is deliberate: acting
+  // on rows the user can no longer see is how a bulk edit touches something
+  // unintended, and the modals show exactly what they will apply to. The refs stay
+  // selected so paging back restores them.
+  const selectedRows = useMemo(() => {
+    const onScreen = new Map(
+      (transactionsPage?.data || []).map((r) => [r.Chq_Ref_Number, r])
+    );
+    return selectedRefs
+      .map((ref) => onScreen.get(ref))
+      .filter((r): r is Transaction => Boolean(r));
+  }, [selectedRefs, transactionsPage]);
 
   // Dedicated paginated transactions for Tab 3 Category Editor
   const editorFilters: Filters = {
@@ -210,7 +295,6 @@ export default function DashboardPage() {
   const {
     transactionsPage: editorTxPage,
     isLoading: editorTxLoading,
-    mutate: mutateEditorTx,
   } = useTransactions(editorFilters, editorPage, editorPageSize, editorSortBy, editorSortOrder, ready);
 
   // Scope a drill-down to the clicked period. A month label ("2024-03") resolves
@@ -260,19 +344,95 @@ export default function DashboardPage() {
   const { monthlyCategoryData: catMonthlyData, isLoading: catMonthlyLoading } =
     useMonthlyCategorySummary(catMonthFilters, "month", ready);
 
-  // Global refresh after uploads or recategorization
-  const handleDataRefresh = () => {
-    mutateMeta();
-    mutateKPIs();
-    mutateCatKPIs();
-    mutateTransactions();
+  // ---- Legend clicks -------------------------------------------------------
+  //
+  // A clicked legend entry narrows `Filters`, not the chart it was clicked in.
+  // Every panel — the KPI row, all four charts, the summary table and the
+  // transaction list — reads the same `Filters`, so a filter is the only way to
+  // make "show me just that legend" true everywhere at once. Filtering the
+  // chart's own data would leave a header total disagreeing with the rows under
+  // it, which is the failure Decision 17 exists to prevent.
+  //
+  // Clicking the entry that is already applied clears it, so the control is
+  // reversible without hunting for a "reset" elsewhere.
+  const toggleValue = <T,>(list: T[] | undefined, v: T): T[] =>
+    (list ?? []).includes(v) ? (list ?? []).filter((x) => x !== v) : [...(list ?? []), v];
+
+  const applySeries = useCallback(
+    (field: "categories" | "broadCategories" | "subCategories" | "txnTypes", value: string) => {
+      setFilters((prev) => ({ ...prev, [field]: toggleValue(prev[field], value) }));
+      // A narrower result set invalidates the current page, same as a sidebar
+      // filter change.
+      setPage(1);
+      setEditorPage(1);
+    },
+    []
+  );
+
+  // The pie's legend names categories at whichever level is selected, so the
+  // same click has to route to a different filter per level.
+  const selectPieSeries = useCallback(
+    (value: string) => {
+      const field =
+        pieGroupBy === "Category"
+          ? "categories"
+          : pieGroupBy === "Broad_Category"
+            ? "broadCategories"
+            : pieGroupBy === "Sub_Category"
+              ? "subCategories"
+              : "txnTypes";
+      applySeries(field, value);
+    },
+    [pieGroupBy, applySeries]
+  );
+
+  const selectBroadSeries = useCallback(
+    (value: string) => applySeries("broadCategories", value),
+    [applySeries]
+  );
+
+  // Inflow/outflow legends map onto the direction filter. Toggling the direction
+  // that is already applied returns to "all" rather than to the other side,
+  // because clicking "Debits" twice should undo the click, not flip to credits.
+  const selectDirection = useCallback((next: "debits" | "credits") => {
+    setFilters((prev) => ({ ...prev, direction: prev.direction === next ? "all" : next }));
+    setPage(1);
+    setEditorPage(1);
+  }, []);
+
+  // Which pie legend entries are currently applied, for the active marker.
+  const pieSelected =
+    pieGroupBy === "Category"
+      ? filters.categories
+      : pieGroupBy === "Broad_Category"
+        ? filters.broadCategories
+        : pieGroupBy === "Sub_Category"
+          ? filters.subCategories
+          : filters.txnTypes;
+
+  // Global refresh after uploads, recategorization or a direction flip.
+  //
+  // Every /transactions and /categories key is revalidated, NOT just the ones this
+  // component happens to hold a mutate() for. The credit-card panel runs its own
+  // useKPIs/useTransactions with card-scoped keys that live in a child component,
+  // so enumerating only the parent hooks left the card view showing the old
+  // category until something else happened to trigger a re-render. A key filter
+  // catches every current and future cache entry, including ones added later.
+  const { mutate: mutateAll } = useSWRConfig();
+  const handleDataRefresh = useCallback(() => {
+    mutateAll(
+      (key) =>
+        typeof key === "string" &&
+        (key.startsWith("/transactions") || key.startsWith("/cards")),
+      undefined,
+      { revalidate: true }
+    );
+    mutateCategories();
     setPage(1);
     setEditorPage(1);
     setSelectedPeriod(null);
     setSelectedCategoryMonth(null);
-    mutateEditorTx();
-    mutateCategories();
-  };
+  }, [mutateAll, mutateCategories]);
 
   // Tab 3 category metrics. These sit beside the category tables, so they use
   // the spend debits - the same figure the pie and stacked charts plot. Both
@@ -287,8 +447,9 @@ export default function DashboardPage() {
 
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh" }}>
-      {/* Sidebar Controls */}
+    <div className="app-shell">
+      {/* Filter sidebar. Sticky, so it stays reachable as the tab scrolls,
+          while the main column keeps the single page scroll. */}
       <Sidebar
         meta={meta}
         filters={filters}
@@ -299,37 +460,29 @@ export default function DashboardPage() {
         }}
         categories={categories}
         subCategories={subCategories}
-        customCategories={customCategories}
-        onAddCategory={addCategory}
-        onDeleteCategory={deleteCategory}
-        onDataUploaded={handleDataRefresh}
-        onRecategorized={handleDataRefresh}
       />
 
       {/* Main Content Area */}
-      <main style={{
-        flex: 1,
-        padding: "32px 36px",
-        overflowY: "auto",
-        maxWidth: "1600px",
-        margin: "0 auto",
-        width: "100%",
-      }}>
-        {/* App Header */}
-        <div style={{ marginBottom: "28px" }}>
-          <h2 style={{
-            fontSize: "2rem",
-            fontWeight: 800,
-            color: "var(--text-primary)",
-            letterSpacing: "-0.03em",
-            marginBottom: "6px",
-          }}>
-            💳 Bank Statement Intelligence
-          </h2>
-          <p style={{ fontSize: "0.95rem", color: "var(--text-muted)" }}>
-            Interactive Statement Explorer, Monthly/Yearly Grouping, and Categorization
-          </p>
-        </div>
+      <main className="app-main">
+        {/* App header. The title and the data-maintenance controls live here
+            rather than in the sidebar, which is now filters only. */}
+        <header className="page-header">
+          <div>
+            <h1 className="page-title">Bank Statement Intelligence</h1>
+            <p className="page-subtitle">
+              Interactive Statement Explorer, Monthly/Yearly Grouping, and Categorization
+            </p>
+          </div>
+          <DataTools
+            meta={meta}
+            customCategories={customCategories}
+            onAddCategory={addCategory}
+            onDeleteCategory={deleteCategory}
+            onDataUploaded={handleDataRefresh}
+            onRecategorized={handleDataRefresh}
+            onEditDefinitions={() => setDefinitionsOpen(true)}
+          />
+        </header>
 
         {/* 4 Key Metrics */}
         <KpiCards kpis={kpis} isLoading={kpisLoading} />
@@ -341,35 +494,62 @@ export default function DashboardPage() {
           cardCount={cardStatements.length || undefined}
         />
 
-        {/* TAB 1: Time & Group Analytics */}
-        {activeTab === "analytics" && (
-          <div>
+        {/* First run. The import controls moved out of the sidebar, so an empty
+            database would otherwise render five empty charts and no signpost
+            toward the one action that fixes it. */}
+        {meta && meta.years.length === 0 && (
+          <div className="glass-panel empty-state">
+            <div className="empty-state-title">No statements imported yet</div>
+            <p className="empty-state-note">
+              Open <strong>Data</strong> in the header to upload a bank statement
+              (.xls, .xlsx, .csv or .pdf), or load the bundled sample to explore the
+              dashboard with example data.
+            </p>
+          </div>
+        )}
+
+        {/* TAB 1: Overview — the single chart surface. Bank vs card vs both is the
+            sidebar's Spend Basis (plus the card picker), not a tab of its own:
+            the same components read the same shared ledger either way, so a
+            separate card tab was a seven-component clone of this one. */}
+        {activeTab === "overview" && (
+          <div className="stack">
+            {/* Card-framed labels for the same totals. The shared KPI row calls
+                them "Credits"/"Debits", which is right for a bank but understates
+                a card: a credit there is a refund or a bill payment, not income.
+                Shown only when the scope is a card, because that is the only
+                reading where these labels are the accurate ones. */}
+            {filters.spendBasis === "card_only" && (
+              <CardTiles kpis={kpis} isLoading={kpisLoading} cards={meta?.cards ?? []} cardIds={filters.cardIds ?? []} />
+            )}
+
             {/* Timeline bar chart (Credit vs Debit) */}
             <TimelineChart
               data={timeline}
               groupBy={groupBy}
               onChangeGroupBy={setGroupBy}
               isLoading={timelineLoading}
+              onSelectDirection={selectDirection}
+              activeDirection={filters.direction}
             />
 
             {/* Monthly cash flow by category stacked bar */}
             <CategoryStackChart
               data={monthlyCategoryData}
               isLoading={catStackLoading}
+              onSelectSeries={selectBroadSeries}
+              selectedValues={filters.broadCategories}
             />
 
             {/* Donut and Balance trend row */}
-            <div style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(400px, 1fr))",
-              gap: "20px",
-              marginBottom: "24px",
-            }}>
+            <div className="split-2">
               <PieChart
                 data={categoryBreakdown}
                 groupBy={pieGroupBy}
                 onChangeGroupBy={setPieGroupBy}
                 isLoading={pieLoading}
+                onSelectSeries={selectPieSeries}
+                selectedValues={pieSelected}
               />
               <BalanceTrendChart
                 data={balanceTrend}
@@ -396,53 +576,120 @@ export default function DashboardPage() {
                 onPreviewRule={previewRule}
                 onApplyCascade={applyCascadeRule}
                 onRefresh={handleDataRefresh}
+                /* Same note writer as the explorer table, so a note written
+                   in a drill-down is the note that shows there. */
+                onNoteSave={async (ref, note) => {
+                  await writeNote({ chq_refs: [ref], note });
+                }}
               />
             )}
           </div>
         )}
 
-        {/* TAB 2: Interactive Search & Table */}
-        {activeTab === "explorer" && (
-          <div>
-            <TransactionTable
-              data={transactionsPage?.data || []}
-              total={transactionsPage?.total || 0}
-              page={page}
-              pageSize={pageSize}
-              onChangePage={setPage}
-              onChangePageSize={(sz) => {
-                setPageSize(sz);
-                setPage(1);
-              }}
-              isLoading={txLoading}
-              exportFilters={filters}
-              exportLabel="Download Filtered CSV"
-              onEditDirection={openDirectionEditor}
-            />
-          </div>
-        )}
+        {/* TAB 2: Transactions — find a row and correct it, in one place. */}
+        {activeTab === "transactions" && (
+          <div className="stack">
+            <div className="tab-nav" role="tablist">
+              <button
+                role="tab"
+                className="tab-btn"
+                aria-selected={txView === "browse"}
+                onClick={() => setTxView("browse")}
+              >
+                <span aria-hidden>🔎</span> Browse
+              </button>
+              <button
+                role="tab"
+                className="tab-btn"
+                aria-selected={txView === "reassign"}
+                onClick={() => setTxView("reassign")}
+              >
+                <span aria-hidden>✏️</span> Reassign Categories
+              </button>
+            </div>
 
-        {/* TAB 3: Broad Categories */}
-        {activeTab === "categories" && (
-          <div>
+            {txView === "browse" && (
+              <TransactionTable
+                data={transactionsPage?.data || []}
+                total={transactionsPage?.total || 0}
+                page={page}
+                pageSize={pageSize}
+                onChangePage={setPage}
+                onChangePageSize={(sz) => {
+                  setPageSize(sz);
+                  setPage(1);
+                }}
+                isLoading={txLoading}
+                exportFilters={filters}
+                exportLabel="Download Filtered CSV"
+                onEditDirection={openDirectionEditor}
+                /* Both editors on one table. The category dropdowns used to
+                   live only on the bulk workbench and the card view, which left
+                   this table — the first place anyone looks for a row — unable
+                   to correct a mis-filed category. */
+                onCategoryChange={handleCategoryChange}
+                categories={categories}
+                subCategories={subCategories}
+                sortBy={txSortBy}
+                sortOrder={txSortOrder}
+                onSortChange={(col, order) => {
+                  setTxSortBy(col);
+                  setTxSortOrder(order);
+                  setPage(1);
+                }}
+                onNoteSave={async (ref, note) => {
+                  await writeNote({ chq_refs: [ref], note });
+                }}
+                selectedRefs={selectedRefs}
+                onSelectionChange={setSelectedRefs}
+                renderBulkActions={() => (
+                  <>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => setBulkMode("category")}
+                      title="Apply one category to the selected rows, as individual pins"
+                    >
+                      Reassign
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => setBulkMode("note")}
+                      title="Write the same note on the selected rows"
+                    >
+                      Add note
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-primary"
+                      onClick={() => setSuggestOpen(true)}
+                      disabled={!llmStatus?.available}
+                      title={
+                        llmStatus?.available
+                          ? "Ask the local opencode server to suggest a category for the selected rows"
+                          : llmStatus?.detail ||
+                            "No opencode server is reachable on OPENCODE_SERVER_URL"
+                      }
+                    >
+                      Suggest
+                    </button>
+                  </>
+                )}
+              />
+            )}
+
+            {txView === "reassign" && (
+              <>
             {/* Category Selector Bar — cascading Parent › Category › Leaf */}
-            <div className="glass-panel" style={{ padding: "20px", marginBottom: "24px" }}>
-              <div style={{ display: "flex", alignItems: "flex-end", gap: "16px", flexWrap: "wrap" }}>
-                <div>
-                  <label
-                    style={{
-                      display: "block",
-                      fontWeight: 700,
-                      fontSize: "0.75rem",
-                      color: "var(--text-muted)",
-                      marginBottom: "4px",
-                      textTransform: "uppercase",
-                      letterSpacing: "0.05em",
-                    }}
-                  >
+            <div className="glass-panel" style={{ padding: "18px" }}>
+              <div className="field-inline-row">
+                <div className="field-inline">
+                  <label className="field-inline-label" htmlFor="sel-parent">
                     Parent Category
                   </label>
                   <select
+                    id="sel-parent"
                     className="select"
                     value={selectedParent}
                     onChange={(e) => {
@@ -458,7 +705,7 @@ export default function DashboardPage() {
                         setSelectedSubCategory("");
                       }
                     }}
-                    style={{ width: "auto", minWidth: "180px", fontWeight: 600 }}
+                    style={{ fontWeight: 600 }}
                   >
                     <option value="">All parent categories</option>
                     {parentsForSelector.map((c) => (
@@ -469,21 +716,12 @@ export default function DashboardPage() {
                   </select>
                 </div>
 
-                <div>
-                  <label
-                    style={{
-                      display: "block",
-                      fontWeight: 700,
-                      fontSize: "0.75rem",
-                      color: "var(--text-muted)",
-                      marginBottom: "4px",
-                      textTransform: "uppercase",
-                      letterSpacing: "0.05em",
-                    }}
-                  >
+                <div className="field-inline">
+                  <label className="field-inline-label" htmlFor="sel-broad">
                     Broad Category
                   </label>
                   <select
+                    id="sel-broad"
                     className="select"
                     value={selectedCategory}
                     onChange={(e) => {
@@ -491,7 +729,7 @@ export default function DashboardPage() {
                       setSelectedSubCategory("");
                       setEditorPage(1);
                     }}
-                    style={{ width: "auto", minWidth: "200px", fontWeight: 600 }}
+                    style={{ fontWeight: 600 }}
                   >
                     <option value="">All broad categories</option>
                     {broadUnderParent.map((c) => (
@@ -502,28 +740,19 @@ export default function DashboardPage() {
                   </select>
                 </div>
 
-                <div>
-                  <label
-                    style={{
-                      display: "block",
-                      fontWeight: 700,
-                      fontSize: "0.75rem",
-                      color: "var(--text-muted)",
-                      marginBottom: "4px",
-                      textTransform: "uppercase",
-                      letterSpacing: "0.05em",
-                    }}
-                  >
+                <div className="field-inline">
+                  <label className="field-inline-label" htmlFor="sel-sub">
                     Sub-Category
                   </label>
                   <select
+                    id="sel-sub"
                     className="select"
                     value={selectedSubCategory}
                     onChange={(e) => {
                       setSelectedSubCategory(e.target.value);
                       setEditorPage(1);
                     }}
-                    style={{ width: "auto", minWidth: "200px", fontWeight: 600 }}
+                    style={{ fontWeight: 600 }}
                   >
                     <option value="">All sub-categories</option>
                     {leavesForSelectedCategory.map((c) => (
@@ -536,59 +765,40 @@ export default function DashboardPage() {
               </div>
 
               {/* Full hierarchy path for the current selection */}
-              <div style={{
-                marginTop: "14px",
-                paddingTop: "12px",
-                borderTop: "1px solid var(--border-subtle)",
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-                flexWrap: "wrap",
-                fontSize: "0.85rem",
-              }}>
-                <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Hierarchy:</span>
+              <div className="path-row">
+                <span className="path-label">Hierarchy:</span>
                 <span className="badge badge-gray">{selectedParentOfCategory || "—"}</span>
-                <span style={{ color: "var(--text-muted)" }}>›</span>
+                <span className="path-sep">›</span>
                 <span className="badge badge-indigo">{selectedCategory || "—"}</span>
-                <span style={{ color: "var(--text-muted)" }}>›</span>
+                <span className="path-sep">›</span>
                 <span className="badge badge-gray">
                   {selectedSubCategory || "All sub-categories"}
                 </span>
               </div>
+
               {/* Category mini KPIs */}
-              <div style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                gap: "12px",
-                marginTop: "16px",
-              }}>
-                <div style={{ padding: "12px", background: "rgba(255, 255, 255, 0.02)", borderRadius: "var(--radius-md)" }}>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Total Debits</div>
-                  <div style={{ fontSize: "1.2rem", fontWeight: 700, color: "var(--rose-outflow)" }}>
-                    {formatCurrency(catDebits)}
-                  </div>
+              <div className="stat-row" style={{ marginTop: "14px" }}>
+                <div className="stat-tile">
+                  <div className="stat-label">Total Debits</div>
+                  <div className="stat-value text-outflow">{formatCurrency(catDebits)}</div>
                 </div>
-                <div style={{ padding: "12px", background: "rgba(255, 255, 255, 0.02)", borderRadius: "var(--radius-md)" }}>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Total Credits</div>
-                  <div style={{ fontSize: "1.2rem", fontWeight: 700, color: "var(--emerald-inflow)" }}>
-                    {formatCurrency(catCredits)}
-                  </div>
+                <div className="stat-tile">
+                  <div className="stat-label">Total Credits</div>
+                  <div className="stat-value text-inflow">{formatCurrency(catCredits)}</div>
                 </div>
-                <div style={{ padding: "12px", background: "rgba(255, 255, 255, 0.02)", borderRadius: "var(--radius-md)" }}>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Net Flow</div>
-                  <div style={{
-                    fontSize: "1.2rem",
-                    fontWeight: 700,
-                    color: catCredits - catDebits >= 0 ? "var(--emerald-inflow)" : "var(--rose-outflow)",
-                  }}>
+                <div className="stat-tile">
+                  <div className="stat-label">Net Flow</div>
+                  <div
+                    className={`stat-value ${
+                      catCredits - catDebits >= 0 ? "text-inflow" : "text-outflow"
+                    }`}
+                  >
                     {formatCurrency(catCredits - catDebits)}
                   </div>
                 </div>
-                <div style={{ padding: "12px", background: "rgba(255, 255, 255, 0.02)", borderRadius: "var(--radius-md)" }}>
-                  <div style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Transactions</div>
-                  <div style={{ fontSize: "1.2rem", fontWeight: 700, color: "var(--text-primary)" }}>
-                    {formatNumber(catCount)}
-                  </div>
+                <div className="stat-tile">
+                  <div className="stat-label">Transactions</div>
+                  <div className="stat-value text-primary">{formatNumber(catCount)}</div>
                 </div>
               </div>
             </div>
@@ -600,6 +810,8 @@ export default function DashboardPage() {
                 selectedSubCategory || selectedCategory || selectedParent || "All categories"
               }
               isLoading={trendLoading}
+              onSelectDirection={selectDirection}
+              activeDirection={filters.direction}
             />
 
             {/* Clickable month-by-month breakdown for the selected category */}
@@ -626,6 +838,11 @@ export default function DashboardPage() {
                 onPreviewRule={previewRule}
                 onApplyCascade={applyCascadeRule}
                 onRefresh={handleDataRefresh}
+                /* Same note writer as the explorer table, so a note written
+                   in a drill-down is the note that shows there. */
+                onNoteSave={async (ref, note) => {
+                  await writeNote({ chq_refs: [ref], note });
+                }}
               />
             )}
 
@@ -661,23 +878,42 @@ export default function DashboardPage() {
               onRefresh={handleDataRefresh}
               isLoading={editorTxLoading}
             />
+              </>
+            )}
           </div>
         )}
 
-        {/* TAB 4: Credit Cards
-            Cycle statements, card spend by category, and the bank reconciliation.
-            The sidebar's spend-basis toggle still governs what the other three
-            tabs report; this tab is the card-specific detail behind it. */}
+        {/* TAB 3: Cards — what the bank schema cannot hold: the issuer's printed
+            cycle totals, its own category, and whether the bank actually paid
+            each statement. Card *spend* is not here: it is the Overview tab
+            with the sidebar's basis set to Card. */}
         {activeTab === "cards" && (
-          <div>
+          <div className="stack">
             <CreditCardsPanel
+              onPreviewRule={previewRule}
+              onApplyCascade={applyCascadeRule}
+              onRefresh={handleDataRefresh}
+            />
+          </div>
+        )}
+
+        {/* TAB 4: Insights — a plain-language read on the same filtered range.
+            Reads the shared sidebar filters, so it can never describe a different
+            period or scope than the tabs above it. */}
+        {activeTab === "insights" && (
+          <div className="stack">
+            <InsightsPanel
               filters={filters}
-              meta={meta}
+              ready={ready}
+              txnTypes={meta?.txn_types ?? []}
               categories={categories}
               subCategories={subCategories}
               onPreviewRule={previewRule}
               onApplyCascade={applyCascadeRule}
               onRefresh={handleDataRefresh}
+              onNoteSave={async (ref, note) => {
+                await writeNote({ chq_refs: [ref], note });
+              }}
             />
           </div>
         )}
@@ -697,6 +933,97 @@ export default function DashboardPage() {
           }}
         />
 
+        {/* The one category editor, opened by any table that supplies
+            onCategoryChange. A cascade can be scoped to this transaction, the
+            same merchant, or a narration keyword, with per-row exclusions. */}
+        <CascadeModal
+          isOpen={isCascadeOpen}
+          pendingEdits={pendingEdits}
+          subCategories={subCategories}
+          onClose={() => setIsCascadeOpen(false)}
+          onPreviewRule={previewRule}
+          onApplyCascade={async (req) => {
+            await applyCascadeRule(req);
+            handleDataRefresh();
+          }}
+        />
+
+        {/* Bulk edits over the ticked rows. Applying a category goes out as one
+            `txn` pin per selected row rather than as a merchant or narration
+            rule: the selection is a set of rows the user looked at, and widening
+            it to rows they never saw is what CascadeModal is for. */}
+        <BulkEditModal
+          isOpen={bulkMode !== null}
+          mode={bulkMode ?? "category"}
+          selectedRows={selectedRows}
+          categories={categories}
+          leavesOf={meta?.leaves_of ?? {}}
+          onClose={() => setBulkMode(null)}
+          onApplyCategory={async (category, subCategory) => {
+            await applyRules(
+              selectedRows.map((r) => ({
+                rule_type: "txn" as const,
+                rule_key: r.Chq_Ref_Number,
+                category,
+                sub_category: subCategory,
+              }))
+            );
+            handleDataRefresh();
+          }}
+          onApplyNote={async (note) => {
+            await writeNote({
+              chq_refs: selectedRows.map((r) => r.Chq_Ref_Number),
+              note,
+            });
+          }}
+        />
+
+        {/* Suggestions. Nothing is applied until a row is ticked here, so a model
+            that is confidently wrong cannot change the ledger by itself. */}
+        <SuggestModal
+          isOpen={suggestOpen}
+          rows={selectedRows}
+          categories={categories}
+          onClose={() => setSuggestOpen(false)}
+          onSuggest={(description) =>
+            suggest(selectedRows.map((r) => r.Chq_Ref_Number), description)
+          }
+          onApply={async (entries) => {
+            await applyRules(
+              entries.map((e) => ({
+                rule_type: "txn" as const,
+                rule_key: e.chq_ref,
+                category: e.category,
+                sub_category: e.subCategory,
+              }))
+            );
+            // Notes go in per distinct note rather than per row: the writer takes
+            // a list of references and one note, so rows sharing a note are one
+            // call instead of one each.
+            const byNote = new Map<string | null, string[]>();
+            entries.forEach((e) => {
+              const list = byNote.get(e.note) || [];
+              list.push(e.chq_ref);
+              byNote.set(e.note, list);
+            });
+            await Promise.all(
+              Array.from(byNote.entries()).map(([note, refs]) =>
+                writeNote({ chq_refs: refs, note, source: note ? "llm" : "user" })
+              )
+            );
+            handleDataRefresh();
+            setSelectedRefs([]);
+          }}
+        />
+
+        <CategoryDefinitionsPanel
+          isOpen={definitionsOpen}
+          definitions={definitions}
+          onClose={() => setDefinitionsOpen(false)}
+          onSave={async (payload) => {
+            await upsertDefinition(payload);
+          }}
+        />
       </main>
     </div>
   );

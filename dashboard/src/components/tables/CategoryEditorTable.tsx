@@ -5,6 +5,7 @@ import { Transaction, CascadeMode, PreviewRuleResponse, ApplyCascadeRequest } fr
 import { formatCurrency, formatDate, formatNumber } from "@/lib/formatters";
 import { useClampPage } from "@/hooks/useClampPage";
 import CascadeModal, { PendingEdit } from "@/components/modals/CascadeModal";
+import SortableHeader from "@/components/tables/SortableHeader";
 
 const CATEGORY_SELECT = {
   padding: "6px 10px",
@@ -91,30 +92,16 @@ export default function CategoryEditorTable({
     col: string;
     label: string;
     align?: "left" | "right";
-  }) => {
-    const active = sortBy === col;
-    const nextOrder: "asc" | "desc" = active && sortOrder === "asc" ? "desc" : "asc";
-    return (
-      <th
-        style={{
-          padding: "10px 12px",
-          color: "var(--text-muted)",
-          fontWeight: 600,
-          textAlign: align,
-          cursor: "pointer",
-          userSelect: "none",
-          whiteSpace: "nowrap",
-        }}
-        onClick={() => onSortChange(col, nextOrder)}
-        title={`Sort by ${label}`}
-      >
-        {label}{" "}
-        <span style={{ fontSize: "0.7rem", color: active ? "var(--accent-indigo)" : "var(--text-muted)" }}>
-          {active ? (sortOrder === "asc" ? "▲" : "▼") : "↕"}
-        </span>
-      </th>
-    );
-  };
+  }) => (
+    <SortableHeader
+      col={col}
+      label={label}
+      align={align}
+      sortBy={sortBy}
+      sortOrder={sortOrder}
+      onSortChange={onSortChange}
+    />
+  );
 
   return (
     <div className="glass-panel" style={{ padding: "24px" }}>

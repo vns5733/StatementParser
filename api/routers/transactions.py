@@ -42,6 +42,10 @@ SORTABLE_COLUMNS = {
     "Broad_Category": "Broad_Category",
     "Sub_Category": "Sub_Category",
     "is_recurring": "is_recurring",
+    # Notes are sorted server-side for the same reason every other column is: these
+    # tables are paginated, so sorting the visible page would reorder only that page
+    # and hide the rows the user was looking for.
+    "Note": "Note",
 }
 
 
@@ -191,8 +195,11 @@ def _get_filtered_df(
     spend_basis: str = "all",
     account_sources: Optional[List[str]] = None,
     card_ids: Optional[List[str]] = None,
+    payee: Optional[List[str]] = None,
     exclude_settlements: bool = False,
     include_settlements: bool = False,
+    direction_mismatch: Optional[bool] = None,
+    has_note: Optional[bool] = None,
 ) -> pd.DataFrame:
     """
     Shared filter path for every endpoint.
@@ -211,10 +218,20 @@ def _get_filtered_df(
     Card_ID is NULL), so it is a no-op there rather than an error - which lets
     the card view reuse this same path for both ledgers.
 
+    `payee` matches `Payee_Receiver` exactly, for the Insights merchant drill-down.
+    Exact rather than substring on purpose: `search` would also match the same text
+    appearing in the Narration or a Reference_ID, so drilling into one merchant
+    could surface rows belonging to a different one. Null payees never match, which
+    is correct - a row with no merchant is not "this merchant".
+
     Callers should pass keyword arguments. The signature is long enough that
     positional calls silently mis-bind (see the timeline/monthly-category/
     category-breakdown endpoints, which shipped with year_months bound to
     sub_list and account_sources dropped entirely).
+
+    `direction_mismatch` and `has_note` are appended last for the same reason the
+    others are keyword-only in practice: each new parameter added to the middle of
+    this signature has shifted a positional call somewhere else.
     """
     df = get_all_transactions_with_details(engine)
     if df.empty:
@@ -226,6 +243,8 @@ def _get_filtered_df(
     if card_ids and "Card_ID" in df.columns:
         # Bank rows carry no Card_ID, so this simply matches nothing there.
         df = df[df["Card_ID"].isin(card_ids)]
+    if payee and "Payee_Receiver" in df.columns:
+        df = df[df["Payee_Receiver"].isin(payee)]
     df = _apply_spend_basis(
         df,
         spend_basis,
@@ -253,6 +272,15 @@ def _get_filtered_df(
 
     if is_recurring is not None and "is_recurring" in df.columns:
         df = df[df["is_recurring"].astype(bool) == bool(is_recurring)]
+    # Rows whose category disagrees with the side their money moved. A filter
+    # rather than a correction on purpose: the reconciler already auto-fixes the
+    # cases it can be sure about (CREDIT_INVERSE), and what is left here is the
+    # part a rule or a human has to decide.
+    if direction_mismatch is not None and "Direction_Mismatch" in df.columns:
+        df = df[df["Direction_Mismatch"].astype(bool) == bool(direction_mismatch)]
+    if has_note is not None and "Note" in df.columns:
+        noted = df["Note"].notna() & df["Note"].astype(str).str.strip().ne("")
+        df = df[noted if has_note else ~noted]
     if txn_types:
         df = df[df["Transaction_Type"].isin(txn_types)]
     if broad_categories:
@@ -305,7 +333,10 @@ def list_transactions(
     spend_basis: str = Query("all", description="all | bank_only | card_only"),
     account_sources: Optional[str] = Query(None, description="Comma-separated BANK,CREDIT_CARD"),
     card_ids: Optional[str] = Query(None, description="Comma-separated Card_ID values"),
+    payee: Optional[str] = Query(None, description="Comma-separated exact Payee_Receiver values"),
     year_months: Optional[str] = Query(None, description="Comma-separated YYYY-MM periods, e.g. 2024-03"),
+    direction_mismatch: Optional[bool] = Query(None, description="Only rows whose category disagrees with the side their money moved"),
+    has_note: Optional[bool] = Query(None, description="Only rows with (or without) a user note"),
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=1000),
     sort_by: Optional[str] = Query(None, description="Column to sort by (Date, Narration, Payee_Receiver, Debit_Amount, Credit_Amount, Broad_Category)"),
@@ -340,6 +371,9 @@ def list_transactions(
         spend_basis=spend_basis,
         account_sources=src_list,
         card_ids=card_list,
+        payee=_split_csv(payee),
+        direction_mismatch=direction_mismatch,
+        has_note=has_note,
     )
 
     if sort_by and sort_by in SORTABLE_COLUMNS and sort_by in df.columns:
@@ -372,6 +406,17 @@ def list_transactions(
         # Resolved direction (DEBIT / CREDIT) after any user override, plus where
         # it came from, so the UI can show and toggle a correction.
         "Direction", "Direction_Source",
+        # The user's own note on this transaction. Part of the row rather than a
+        # separate fetch, because a note that needed its own request would either
+        # be absent from the table or arrive after it, and both look like the note
+        # was lost.
+        "Note", "Note_Source", "Note_Updated_At", "Suggestion",
+        # Direction reconciliation. Category_Direction is what the category is
+        # about; the other two say whether this row agrees with it, and what it was
+        # before the reconciler moved it. Without the third, a reclassified row
+        # shows a label the parser never produced and cannot be traced.
+        "Category_Direction", "Direction_Mismatch", "Direction_Mismatch_Reason",
+        "Direction_Reclassified",
     ]
     display_cols = [c for c in cols if c in df_page.columns]
     return {
@@ -982,11 +1027,18 @@ def export_transactions(
     account_sources: Optional[str] = Query(None, description="Comma-separated BANK,CREDIT_CARD"),
     card_ids: Optional[str] = Query(None, description="Comma-separated Card_ID values"),
     year_months: Optional[str] = Query(None, description="Comma-separated YYYY-MM periods"),
+    direction_mismatch: Optional[bool] = Query(None, description="Only rows whose category disagrees with the side their money moved"),
+    has_note: Optional[bool] = Query(None, description="Only rows with (or without) a user note"),
     engine: Engine = Depends(get_engine),
 ):
     """
     Streams every row matching the active filters as CSV — not just the current
     page — so exports match what the user sees across the whole filtered set.
+
+    Every filter the list endpoint accepts is accepted here. The export's promise
+    is that it is the same set the user is looking at, and a filter the list
+    honours but the export ignores breaks that promise silently: the rows are
+    simply not there.
     """
     df = _get_filtered_df(
         engine,
@@ -1006,6 +1058,8 @@ def export_transactions(
         spend_basis=spend_basis,
         account_sources=_split_csv(account_sources),
         card_ids=_split_csv(card_ids),
+        direction_mismatch=direction_mismatch,
+        has_note=has_note,
     )
 
     if "Date" in df.columns:
@@ -1281,6 +1335,281 @@ def delete_direction_rule_list(
 ):
     deleted = delete_direction_rules(engine, body.rule_type, body.rule_keys)
     return {"success": True, "deleted": deleted}
+
+
+
+
+# ---------------------------------------------------------------------------
+# GET /api/transactions/insights -- spending insights for a time range
+# ---------------------------------------------------------------------------
+@router.get("/insights")
+def get_spending_insights(
+    years: Optional[str] = Query(None),
+    months: Optional[str] = Query(None),
+    year_months: Optional[str] = Query(None),
+    txn_types: Optional[str] = Query(None),
+    broad_categories: Optional[str] = Query(None),
+    sub_categories: Optional[str] = Query(None),
+    categories: Optional[str] = Query(None),
+    is_recurring: Optional[bool] = Query(None),
+    search: Optional[str] = Query(None),
+    direction: Optional[str] = Query(None, description="all | debits | credits"),
+    amount_field: Optional[str] = Query(None, description="debit | credit | any"),
+    amount_min: Optional[float] = Query(None, description="Minimum amount"),
+    amount_max: Optional[float] = Query(None, description="Maximum amount"),
+    account_sources: Optional[str] = Query(None),
+    card_ids: Optional[str] = Query(None),
+    spend_basis: str = Query("all", description="all | bank_only | card_only"),
+    engine: Engine = Depends(get_engine),
+):
+    """
+    Returns comprehensive spending insights for the filtered time range:
+    - Monthly spend trend (debits/credits/net)
+    - Top categories by spend (with sub-category breakdown)
+    - Top merchants/payees by spend
+    - Transaction type breakdown (UPI, ATM, NEFT, etc.)
+    - Recurring vs one-off spending
+    - Savings rate (income vs expenses)
+    - Day of week spending pattern
+    - Card vs bank spend comparison
+
+    Takes the FULL sidebar filter set, not just the date range, so the tab reads
+    from the same scope as every other tab. Accepting only years/months was a trap:
+    the user narrows to a category or types a merchant search, the sidebar visibly
+    changes, and this tab quietly reports the unfiltered set - so it looked broken
+    rather than ignoring them. `direction` and the amount range were dropped from
+    the signature on the same reasoning: FastAPI ignores unknown query params
+    silently, so an omitted one is invisible rather than an error.
+    """
+    year_list = _split_int_csv(years)
+    month_list = _split_int_csv(months)
+    ym_list = _split_csv(year_months)
+    src_list = _split_csv(account_sources)
+    card_list = _split_csv(card_ids)
+
+    df = _get_filtered_df(
+        engine,
+        years=year_list,
+        months=month_list,
+        year_months=ym_list,
+        txn_types=_split_csv(txn_types),
+        broad_categories=_split_csv(broad_categories),
+        sub_categories=_split_csv(sub_categories),
+        categories=_split_csv(categories),
+        is_recurring=is_recurring,
+        search=search,
+        direction=direction,
+        amount_field=amount_field,
+        amount_min=amount_min,
+        amount_max=amount_max,
+        spend_basis=spend_basis,
+        account_sources=src_list,
+        card_ids=card_list,
+        # This endpoint mixes CASHFLOW blocks (monthly_trend, savings_analysis)
+        # with SPEND blocks (the category / merchant / channel breakdowns), and the
+        # two need different settlement corrections. So the frame is fetched whole
+        # and split below. Hardcoding exclude_settlements=True would delete genuine
+        # bank outflow and card inflow from a single-ledger view - the exact bug
+        # Decision 27 was written about.
+        include_settlements=True,
+    )
+
+    if df.empty:
+        return {
+            "monthly_trend": [],
+            "top_categories": [],
+            "top_merchants": [],
+            "txn_type_breakdown": [],
+            "recurring_vs_oneoff": {"recurring_spend": 0, "oneoff_spend": 0, "recurring_count": 0, "oneoff_count": 0},
+            "savings_analysis": {"total_income": 0, "total_expenses": 0, "savings": 0, "savings_rate": 0},
+            "dow_pattern": [],
+            "account_source_breakdown": [],
+            "settlements": {
+                "settlement_debits": 0.0,
+                "settlement_credits": 0.0,
+                "settlement_count": 0,
+                "excluded_from_cashflow": bool(
+                    _settlement_handling(spend_basis, src_list)
+                ),
+            },
+            "period": {"start": None, "end": None, "months": 0},
+        }
+
+    # Ensure Date is datetime
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    # SPEND blocks always drop settlements: paying a card bill is a transfer, not
+    # a purchase, and the category charts exclude them for the same reason.
+    # CASHFLOW blocks drop them only when this view's scope makes the double count
+    # real - i.e. in the combined view, where both halves of the payment are
+    # present. A single-ledger view keeps the one half it actually contains: as
+    # inflow on the card, as outflow on the bank.
+    _settled = (
+        df["Is_Settlement"].fillna(False) if "Is_Settlement" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    _spend_df = df[~_settled]
+    _cashflow_df = (
+        _spend_df if _settlement_handling(spend_basis, src_list) else df
+    )
+
+    _cashflow_df = _cashflow_df.copy()
+    _spend_df = _spend_df.copy()
+    for _f in (_cashflow_df, _spend_df):
+        _f["DayOfWeek"] = _f["Date"].dt.dayofweek  # 0=Monday
+        _f["DayOfWeekName"] = _f["Date"].dt.day_name()
+
+    # Period info describes the range the view matched, not the rows that
+    # survived either correction - a card-only view of one month still has a month.
+    period_start = df["Date"].min()
+    period_end = df["Date"].max()
+    months_in_period = ((period_end.year - period_start.year) * 12 + period_end.month - period_start.month) + 1
+
+    # 1. Monthly cashflow trend
+    monthly = _cashflow_df.groupby("Year_Month").agg(
+        Total_Debit=("Debit_Amount", "sum"),
+        Total_Credit=("Credit_Amount", "sum"),
+        Txn_Count=("Chq_Ref_Number", "count"),
+    ).reset_index().sort_values("Year_Month")
+    monthly["Net"] = monthly["Total_Credit"] - monthly["Total_Debit"]
+    monthly_trend = _df_to_records(monthly)
+
+    # 2. Top categories by spend (using Category - parent rollup)
+    _debits = _spend_df[_spend_df["Debit_Amount"] > 0]
+    cat_spend = _debits.groupby("Category").agg(
+        Spend=("Debit_Amount", "sum"),
+        Count=("Chq_Ref_Number", "count"),
+    ).reset_index().sort_values("Spend", ascending=False)
+
+    # Leaves and the recurring split are grouped ONCE over the whole spend set
+    # rather than re-filtering per category. The per-category loop this replaced
+    # scanned the full frame N times, so a wide category range cost O(n^2) on
+    # every call - and the dashboard fires this whenever any filter changes.
+    _is_recurring = (
+        _debits["is_recurring"].astype(bool)
+        if "is_recurring" in _debits.columns
+        else pd.Series(False, index=_debits.index)
+    )
+    # Both grouping keys must be passed in the SAME groupby. Grouping by
+    # Sub_Category first and then re-grouping by Category raises KeyError,
+    # because the first aggregation keeps only the key it grouped on.
+    _leaves = (
+        _debits.groupby(["Category", "Sub_Category"])
+        .agg(Spend=("Debit_Amount", "sum"), Count=("Chq_Ref_Number", "count"))
+        .reset_index()
+        .sort_values("Spend", ascending=False)
+    )
+    sub_breakdown = {
+        str(cat): _df_to_records(grp)
+        for cat, grp in _leaves.groupby("Category")
+    }
+    recurring_by_cat = (
+        _debits.assign(_rec=_is_recurring)
+        .groupby(["Category", "_rec"])["Debit_Amount"]
+        .sum()
+        .to_dict()
+    )
+
+    top_categories = _df_to_records(cat_spend)
+    for cat in top_categories:
+        name = cat["Category"]
+        cat["sub_breakdown"] = sub_breakdown.get(name, [])
+        # Recurring vs one-off within the category. A bare total is not actionable
+        # — "rent is 40% of your spend" is, and only a split can say which part is
+        # fixed. Derived from the same settlement-excluded frame as `Spend`, so the
+        # two always add back up.
+        cat["Recurring"] = float(recurring_by_cat.get((name, True), 0.0))
+        cat["One-off"] = float(recurring_by_cat.get((name, False), 0.0))
+
+    # 3. Top merchants/payees by spend
+    merchant_spend = _spend_df[(_spend_df["Debit_Amount"] > 0) & (_spend_df["Payee_Receiver"].notna())].groupby("Payee_Receiver").agg(
+        Spend=("Debit_Amount", "sum"),
+        Count=("Chq_Ref_Number", "count"),
+        Avg_Amount=("Debit_Amount", "mean"),
+    ).reset_index().sort_values("Spend", ascending=False).head(20)
+    top_merchants = _df_to_records(merchant_spend)
+
+    # 4. Transaction type breakdown
+    txn_type_spend = _spend_df[_spend_df["Debit_Amount"] > 0].groupby("Transaction_Type").agg(
+        Spend=("Debit_Amount", "sum"),
+        Count=("Chq_Ref_Number", "count"),
+        Avg_Amount=("Debit_Amount", "mean"),
+    ).reset_index().sort_values("Spend", ascending=False)
+    txn_type_breakdown = _df_to_records(txn_type_spend)
+
+    # 5. Recurring vs one-off spending
+    recurring_df = _spend_df[_spend_df["is_recurring"] == True]
+    oneoff_df = _spend_df[_spend_df["is_recurring"] == False]
+    recurring_spend = recurring_df["Debit_Amount"].sum()
+    oneoff_spend = oneoff_df["Debit_Amount"].sum()
+    recurring_vs_oneoff = {
+        "recurring_spend": float(recurring_spend),
+        "oneoff_spend": float(oneoff_spend),
+        "recurring_count": int(recurring_df.shape[0]),
+        "oneoff_count": int(oneoff_df.shape[0]),
+    }
+
+    # 6. Savings analysis (income vs expenses)
+    total_income = _cashflow_df["Credit_Amount"].sum()
+    total_expenses = _cashflow_df["Debit_Amount"].sum()
+    savings = float(total_income - total_expenses)
+    savings_rate = float(savings / total_income * 100) if total_income > 0 else 0
+    savings_analysis = {
+        "total_income": float(total_income),
+        "total_expenses": float(total_expenses),
+        "savings": savings,
+        "savings_rate": savings_rate,
+    }
+
+    # 7. Day of week spending pattern
+    dow_spend = _spend_df[_spend_df["Debit_Amount"] > 0].groupby(["DayOfWeek", "DayOfWeekName"]).agg(
+        Spend=("Debit_Amount", "sum"),
+        Count=("Chq_Ref_Number", "count"),
+        Avg_Amount=("Debit_Amount", "mean"),
+    ).reset_index().sort_values("DayOfWeek")
+    dow_pattern = _df_to_records(dow_spend)
+
+    # 8. Account source breakdown (bank vs card)
+    if "Account_Source" in _spend_df.columns:
+        src_spend = _spend_df[_spend_df["Debit_Amount"] > 0].groupby("Account_Source").agg(
+            Spend=("Debit_Amount", "sum"),
+            Count=("Chq_Ref_Number", "count"),
+            Avg_Amount=("Debit_Amount", "mean"),
+        ).reset_index().sort_values("Spend", ascending=False)
+        account_source_breakdown = _df_to_records(src_spend)
+    else:
+        account_source_breakdown = []
+
+    # Both settlement halves are reported for THIS view, and alongside them the
+    # scope flag that decided the correction. Without them the spend blocks below
+    # look like they are quietly under-reporting against monthly_trend, and the
+    # client has no way to tell a transfer from a genuine drop in spending.
+    settlement_debits = float(df.loc[_settled, "Debit_Amount"].sum())
+    settlement_credits = float(df.loc[_settled, "Credit_Amount"].sum())
+    settlements = {
+        "settlement_debits": settlement_debits,
+        "settlement_credits": settlement_credits,
+        "settlement_count": int(_settled.sum()),
+        "excluded_from_cashflow": bool(_settlement_handling(spend_basis, src_list)),
+    }
+
+    return {
+        "monthly_trend": monthly_trend,
+        "top_categories": top_categories,
+        "top_merchants": top_merchants,
+        "txn_type_breakdown": txn_type_breakdown,
+        "recurring_vs_oneoff": recurring_vs_oneoff,
+        "savings_analysis": savings_analysis,
+        "dow_pattern": dow_pattern,
+        "account_source_breakdown": account_source_breakdown,
+        "settlements": settlements,
+        "period": {
+            "start": period_start.isoformat() if period_start else None,
+            "end": period_end.isoformat() if period_end else None,
+            "months": int(months_in_period),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

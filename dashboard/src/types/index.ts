@@ -46,7 +46,37 @@ export interface Transaction {
   Card_Issuer?: string | null;
   /** Stable card key; NULL on bank rows. Used by the card view's per-card filter. */
   Card_ID?: string | null;
+  /**
+   * The user's own free-text note on this transaction - what it was actually for,
+   * which a bank narration often does not say.
+   */
+  Note?: string | null;
+  /** Who wrote it: 'user' or 'llm'. An LLM note is a guess, not a confirmation. */
+  Note_Source?: string | null;
+  Note_Updated_At?: string | null;
+  /** The last proposal the LLM made for this row, kept even if rejected. */
+  Suggestion?: string | null;
+  /**
+   * Which side of the ledger this category is about: money in, money out, or both.
+   */
+  Category_Direction?: CategoryDirection;
+  /**
+   * True when the row's category disagrees with the side its money actually moved -
+   * a credit filed under an expense category, most likely a refund. Flagged rather
+   * than moved, because the category is already right for the arithmetic.
+   */
+  Direction_Mismatch?: boolean;
+  Direction_Mismatch_Reason?: string | null;
+  /**
+   * Set when the direction reconciler re-filed this row (a credit on Investment is
+   * money coming back out, so it becomes Investment_Liquidation). Kept so the table
+   * can show what changed instead of presenting a label the parser never produced.
+   */
+  Direction_Reclassified?: string | null;
 }
+
+/** Whether a category is about money arriving, money leaving, or either. */
+export type CategoryDirection = "IN" | "OUT" | "BOTH";
 
 export interface TransactionPage {
   total: number;
@@ -212,6 +242,72 @@ export interface Filters {
    * rather than an error - which lets the card view reuse the same filter path.
    */
   cardIds?: string[];
+  /**
+   * Exact `Payee_Receiver` values, used to drill into one merchant from the
+   * Insights top-merchants list. Exact rather than reusing `search`, which would
+   * also match the same text inside a Narration or Reference_ID and so could
+   * surface another merchant's rows. Not a sidebar control.
+   */
+  payee?: string[];
+  /**
+   * null = both, otherwise only rows whose category disagrees with the side their
+   * money moved (a credit under an expense category, and so on). This is how the
+   * rows the reconciler could NOT fix on its own get found.
+   */
+  directionMismatch?: boolean | null;
+  /** null = both, otherwise only rows with (or without) a user note. */
+  hasNote?: boolean | null;
+}
+
+/** What each category is for, in the user's own words. */
+export interface CategoryDefinition {
+  name: string;
+  description: string | null;
+  /** Concrete merchant or keyword hints. */
+  examples: string | null;
+  /** The direction in force: the user's override, or the code default. */
+  direction: CategoryDirection;
+  /** The user's override, or null when there is none. */
+  direction_override: CategoryDirection | null;
+  /** The code-level default, so a "reset to default" control has something to reset to. */
+  code_direction: CategoryDirection;
+  is_builtin: boolean;
+}
+
+export interface DefinitionsResponse {
+  definitions: CategoryDefinition[];
+}
+
+/** Whether the local opencode server can serve a suggestion, and why not if not. */
+export interface LLMStatus {
+  available: boolean;
+  version: string | null;
+  model: string;
+  detail: string | null;
+}
+
+/** One row's proposal. `category` is null when the model named something off-taxonomy. */
+export interface CategorySuggestion {
+  id: string;
+  category: string | null;
+  sub_category?: string | null;
+  confidence: number | null;
+  note?: string | null;
+  reason?: string | null;
+  /** The off-taxonomy name the model invented, shown so the rejection is visible. */
+  invalid_category?: string | null;
+  /** True when the model returned no entry for this row. */
+  skipped?: boolean;
+}
+
+export interface SuggestResponse {
+  count: number;
+  /** How many rows the model actually answered; count - answered were skipped. */
+  answered: number;
+  suggestions: CategorySuggestion[];
+  /** Source data per answered row, keyed by the same Chq_Ref_Number as `id`. */
+  transactions: Partial<Transaction>[];
+  model: string | null;
 }
 
 /** "all" combines bank and card spend with settlements removed. */
@@ -322,6 +418,115 @@ export interface IssuerCategoryStat {
   Txn_Count: number;
   Issuer_Categorised: number;
   Coverage_Pct: number;
+}
+
+// ---------------------------------------------------------------------------
+// Insights
+// ---------------------------------------------------------------------------
+
+/** One month of the cash-flow trend. `Year_Month` is the label (YYYY-MM). */
+export interface InsightMonth {
+  Year_Month: string;
+  Total_Debit: number;
+  Total_Credit: number;
+  /** Credit minus debit for the month. */
+  Net: number;
+  Txn_Count: number;
+}
+
+/** A parent-rollup category, with its leaves nested underneath. */
+export interface InsightCategory {
+  Category: string;
+  Spend: number;
+  Count: number;
+  /**
+   * Recurring and one-off halves of `Spend`, from the same settlement-excluded
+   * frame, so the two always add back up to the total.
+   */
+  Recurring: number;
+  "One-off": number;
+  sub_breakdown: InsightSubCategory[];
+}
+
+export interface InsightSubCategory {
+  Sub_Category: string;
+  Spend: number;
+  Count: number;
+}
+
+export interface InsightMerchant {
+  Payee_Receiver: string;
+  Spend: number;
+  Count: number;
+  Avg_Amount: number;
+}
+
+export interface InsightTxnType {
+  Transaction_Type: string;
+  Spend: number;
+  Count: number;
+  Avg_Amount: number;
+}
+
+export interface InsightDayOfWeek {
+  /** 0 = Monday. */
+  DayOfWeek: number;
+  DayOfWeekName: string;
+  Spend: number;
+  Count: number;
+  Avg_Amount: number;
+}
+
+export interface InsightSourceSplit {
+  Account_Source: AccountSource;
+  Spend: number;
+  Count: number;
+  Avg_Amount: number;
+}
+
+/**
+ * Settlements are reported rather than silently dropped, alongside the scope flag
+ * that decided the correction. `excluded_from_cashflow` is false for a
+ * single-ledger view, where a bill payment is real inflow (card) or real outflow
+ * (bank) and therefore belongs in the cash-flow blocks.
+ */
+export interface InsightSettlements {
+  settlement_debits: number;
+  settlement_credits: number;
+  settlement_count: number;
+  excluded_from_cashflow: boolean;
+}
+
+export interface InsightsResponse {
+  /** Cash-flow scoped: debits, credits and net per month. */
+  monthly_trend: InsightMonth[];
+  /** Spend scoped: settlements always excluded. */
+  top_categories: InsightCategory[];
+  top_merchants: InsightMerchant[];
+  txn_type_breakdown: InsightTxnType[];
+  recurring_vs_oneoff: {
+    recurring_spend: number;
+    oneoff_spend: number;
+    recurring_count: number;
+    oneoff_count: number;
+  };
+  /** Cash-flow scoped, so savings means what actually moved. */
+  savings_analysis: {
+    total_income: number;
+    total_expenses: number;
+    savings: number;
+    /** Percent of income kept. */
+    savings_rate: number;
+  };
+  dow_pattern: InsightDayOfWeek[];
+  account_source_breakdown: InsightSourceSplit[];
+  settlements: InsightSettlements;
+  period: {
+    start: string | null;
+    end: string | null;
+    /** Inclusive month count between start and end. */
+    months: number;
+  };
 }
 
 export type GroupBy = "month" | "year";

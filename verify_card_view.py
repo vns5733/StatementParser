@@ -11,8 +11,9 @@ Checks the whole card path against the live database:
   7. a single-category drill-down still shows that category's settlement rows
   8. a card bill payment is a CREDIT in the card's own view
   9. a user can flip any row's direction, by txn / merchant / narration
- 10. the summary endpoints honour sub_categories / categories / spend_basis
- 11. CSV export returns the scoped set
+ 10. every table listing transactions can sort, and sorting re-ranks the SET
+ 11. the summary endpoints honour sub_categories / categories / spend_basis
+ 12. CSV export returns the scoped set
 
 Run: python verify_card_view.py
 """
@@ -268,12 +269,20 @@ check(
 # On the card a payment is a CREDIT, so every debit in this view IS a purchase
 # and the two debit figures must be equal. What must NOT happen is the payment
 # inflating outflow - it belongs on the inflow line only.
+# Every debit must be a purchase, and every payment must sit in inflow. The
+# equality on the debit side is the real assertion: it fails if any payment is
+# filed as spend. It is NOT an assertion that the card has no credits of its own
+# - genuine refunds (and the Tata Neu "+ C" rows the issuer marks) are debits
+# here only when the issuer printed them on the debit side, and both directions
+# are equally valid per the statement.
 check(
-    "card view: every debit is a purchase, none is a payment",
-    _kpi_card["total_spend_debits"] == _kpi_card["total_debits"]
-    and _kpi_card["settlement_debits"] == 0,
-    f"debits {_kpi_card['total_debits']:,.2f} = spend, and the"
-    f" {_kpi_card['settlement_credits']:,.2f} of payments sit in inflow",
+    "card view: no payment is filed as spend",
+    # Tolerance, not ==: both figures are float sums and differ in the last bit
+    # (3266034.43 vs 3266034.4299999997). An exact compare fails on rounding.
+    abs(_kpi_card["total_spend_debits"] - _kpi_card["total_debits"]) < 0.01
+    and abs(_kpi_card["settlement_debits"]) < 0.01,
+    f"debits {_kpi_card['total_debits']:,.2f} = spend, none of it a payment;"
+    f" the {_kpi_card['settlement_credits']:,.2f} of payments are in inflow",
 )
 _tl_card = client.get(
     "/api/transactions/summary/timeline?account_sources=CREDIT_CARD&group_by=month"
@@ -292,6 +301,34 @@ check(
     _kpi_bank["settlement_count"] > 0
     and _kpi_bank["total_debits"] > _kpi_bank["total_spend_debits"],
     f"{_kpi_bank['settlement_debits']:,.2f} of card payments in the outflow",
+)
+
+# --- 4b3. card credits must be mostly settlements, not leaked income --------
+# Regression guard. SETTLEMENT_RE named the payment ("BPPY CC PAYMENT") but not
+# the generic transfer wording some issuers use ("NETBANKING TRANSFER", "TELE
+# TRANSFER CREDIT"). Those rows were left unflagged, so 65 bill payments worth
+# 20.6L surfaced as card INFLOW - two thirds of the card's apparent income - and
+# the combined view could not exclude them.
+#
+# The invariant is proportional, not absolute: a genuine refund is a real credit
+# too, so demanding zero would be wrong. But on a card the overwhelming majority
+# of credits are bill payments, so if the detector loses its grip the settled
+# share collapses. Before the fix it was 20% of the value; it is now 90%, and a
+# large drop means some issuer's wording fell through again.
+_all_cc = _card_rows[_card_rows["Credit_Amount"].fillna(0) > 0]
+_unflagged = _all_cc[~_all_cc["Is_Settlement"].fillna(False)]
+_total_cc_credit = float(_all_cc["Credit_Amount"].sum())
+_refund_share = (
+    float(_unflagged["Credit_Amount"].sum()) / _total_cc_credit
+    if _total_cc_credit
+    else 0.0
+)
+check(
+    "most card credit VALUE is a flagged bill payment, not leaked income",
+    _refund_share < 0.25,
+    f"{len(_all_cc)} credits; unflagged {len(_unflagged)} worth"
+    f" {float(_unflagged['Credit_Amount'].sum()):,.0f}"
+    f" = {100 * _refund_share:.1f}% (the rest are genuine refunds)",
 )
 
 # --- 4c. a single-category drill-down must not blank a settlement category ----
@@ -560,6 +597,58 @@ check(
     f"{resp.text.count(chr(10)) - 1} rows",
 )
 check("export is scoped to the card", "CC:" in resp.text and "Account_Source" in resp.text)
+
+# --- 8. sorting -------------------------------------------------------------
+# Every table that lists transactions exposes sortable headers, and sorting must
+# be SERVER-side. These tables are paginated, so sorting the rows on screen would
+# only reorder that page rather than the true top or bottom of the result set -
+# which looks like it worked while silently hiding the rows the user wanted.
+print("\n7. Sorting re-ranks the whole result set")
+for col, key, numeric in (
+    ("Date", "Date", False),
+    ("Debit_Amount", "Debit_Amount", True),
+    ("Narration", "Narration", False),
+    ("Payee_Receiver", "Payee_Receiver", False),
+    ("Credit_Amount", "Credit_Amount", True),
+    ("Broad_Category", "Broad_Category", False),
+):
+
+    def _page(order, n=20):
+        rows = client.get(
+            f"/api/transactions?account_sources=CREDIT_CARD&sort_by={col}"
+            f"&sort_order={order}&page_size={n}"
+        ).json()["data"]
+        # Amounts must compare NUMERICALLY. As strings "168440.0" sorts below
+        # "183718.0", which would report a working sort as broken.
+        return [float(r[key] or 0) if numeric else ("" if r[key] is None else str(r[key]))
+                for r in rows]
+
+    a, d = _page("asc"), _page("desc")
+    check(
+        f"sort_by={col} orders the page monotonically",
+        a == sorted(a) and d == sorted(d, reverse=True) and a != d,
+        f"asc[0]={a[0]!r:.18} desc[0]={d[0]!r:.18}",
+    )
+
+# An unsupported column must be ignored rather than erroring, so a stale or
+# hand-typed query cannot break the table.
+check(
+    "an unknown sort column is ignored, not an error",
+    client.get("/api/transactions?sort_by=NOT_A_COLUMN&page_size=2").status_code == 200,
+)
+# Sorting must not change the row COUNT - it re-orders, it does not filter.
+_unsorted_total = client.get(
+    "/api/transactions?account_sources=CREDIT_CARD&page_size=1"
+).json()["total"]
+_sorted_total = client.get(
+    "/api/transactions?account_sources=CREDIT_CARD&sort_by=Debit_Amount"
+    "&sort_order=desc&page_size=1"
+).json()["total"]
+check(
+    "sorting does not change how many rows match",
+    _unsorted_total == _sorted_total,
+    f"{_unsorted_total} rows either way",
+)
 
 print("\n" + "=" * 72)
 if failures:

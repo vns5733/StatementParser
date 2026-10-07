@@ -11,12 +11,21 @@ import {
 } from "recharts";
 import { CategoryBreakdownEntry, GroupCol } from "@/types";
 import { formatCurrency } from "@/lib/formatters";
+import { legendLabel, legendValue } from "@/lib/legend";
 
 interface PieChartProps {
   data: CategoryBreakdownEntry[];
   groupBy: GroupCol;
   onChangeGroupBy: (g: GroupCol) => void;
   isLoading?: boolean;
+  /**
+   * Called when a legend entry is clicked, with that entry's category name.
+   * The parent narrows `Filters`, which is what makes the click mean "show me
+   * just that one" across the whole dashboard rather than in this chart alone.
+   */
+  onSelectSeries?: (value: string) => void;
+  /** Which series are currently narrowing the view, for the active marker. */
+  selectedValues?: string[];
 }
 
 const COLORS = [
@@ -31,6 +40,8 @@ export default function PieChart({
   groupBy,
   onChangeGroupBy,
   isLoading,
+  onSelectSeries,
+  selectedValues = [],
 }: PieChartProps) {
   const [direction, setDirection] = useState<"Debit" | "Credit">("Debit");
 
@@ -82,6 +93,11 @@ export default function PieChart({
           <p style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
             Share of {direction === "Debit" ? "expenses" : "inflows"} by group
           </p>
+          {onSelectSeries && (
+            <p className="legend-hint">
+              Click a legend entry to narrow every panel to just that one.
+            </p>
+          )}
         </div>
 
         {/* Controls */}
@@ -179,7 +195,14 @@ export default function PieChart({
                 align="right"
                 verticalAlign="middle"
                 wrapperStyle={{ maxHeight: "280px", overflowY: "auto", fontSize: "0.75rem" }}
-                formatter={(val) => <span style={{ color: "var(--text-secondary)" }}>{val}</span>}
+                /* Recharts calls this as (payloadEntry, index, event). A pie
+                   legend has no built-in toggle, so this is the only handler. */
+                onClick={
+                  onSelectSeries ? (entry: any) => onSelectSeries(legendValue(entry)) : undefined
+                }
+                formatter={(val) =>
+                  legendLabel(String(val), String(val), selectedValues.includes(String(val)))
+                }
               />
               <Pie
                 data={chartData}

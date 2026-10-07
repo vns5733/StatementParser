@@ -58,6 +58,35 @@ for path in FILES:
     check(f"{name:46} {anchors:>3} anchors >= {len(df):>3} parsed", anchors >= len(df))
 print(f"       {len(FILES)} statements, {total_rows} rows")
 
+# Anchors >= rows only proves a row was EMITTED, not that it was labelled
+# correctly. A credit read as a debit is still one row, so the check above passes
+# while every payment on the statement is recorded as spend. The issuer prints its
+# own PURCHASES/DEBIT and PAYMENTS/CREDITS RECEIVED totals, which is an independent
+# check on the parsed direction: reconcile both sides against them.
+# Direction reconciliation is checked over EVERY statement, not just the four
+# this file happens to point at: the Tata Neu "+ C" bug affected 12 of 27 and was
+# invisible to a four-file sample. Parsing is still only done for FILES above,
+# because the per-anchor count is the expensive part.
+ALL_STATEMENTS = sorted(glob.glob("masked/CreditCard/*.pdf"))
+print("\n1b. DIRECTION - parsed debits/credits match the issuer's printed totals")
+dir_bad = 0
+for path in ALL_STATEMENTS:
+    df, meta = load_card_statement(path)
+    if df.empty:
+        continue
+    debits = float(df.loc[df["Direction"] == "DEBIT", "Amount"].sum())
+    credits = float(df.loc[df["Direction"] == "CREDIT", "Amount"].sum())
+    ts, pr = meta.get("Total_Spend"), meta.get("Payments_Received")
+    ok_d = ts is None or abs(debits - float(ts)) <= 1
+    ok_c = pr is None or abs(credits - float(pr)) <= 1
+    if not (ok_d and ok_c):
+        dir_bad += 1
+        print(f"  [FAIL] {os.path.basename(path)[:46]}")
+        print(f"         debits {debits:,.2f} vs issuer {ts} | "
+              f"credits {credits:,.2f} vs issuer {pr}")
+check("every statement's parsed direction reconciles with the issuer",
+      dir_bad == 0, f"{len(ALL_STATEMENTS)} statements, {dir_bad} mismatched")
+
 
 print("\n2. LEDGER - card rows reach the shared dashboard table")
 df = get_all_transactions_with_details(engine)

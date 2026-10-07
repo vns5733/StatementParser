@@ -3,6 +3,93 @@ import pandas as pd
 from category_rules import assign_broad_category, assign_sub_category
 
 
+# ---------------------------------------------------------------------------
+# Bare card-descriptor parsing
+#
+# A card statement prints one un-delimited line per purchase:
+#
+#     MAXWARE TECHNOLOGIES PRIVBANGALORE 3732
+#     BOUTIQUE BALI SWING HO BADUNG IDR 1751000.00 48
+#     VERANDALEARINGCHENNAI + 176
+#
+# There is no "UPI-" / "IMPS-" prefix to split on, so the fallback branch used to
+# leave Payee_Receiver null. That was not merely cosmetic: `assign_broad_category`
+# matches merchant rules against the payee, `db._mark_recurring` keys recurrence on
+# it, and the insights endpoint filters its top-merchants list on it. A null payee
+# therefore disabled all three at once, and every one of these rows landed in
+# Uncategorized. On the development data the correlation was exact - all 124
+# Uncategorized rows had a null payee, and no Uncategorized row had one.
+#
+# The city is matched as a SUFFIX, not a token, because the issuer strips the space
+# between the merchant and the city ("...PRIV" + "BANGALORE" -> "PRIVBANGALORE").
+# ---------------------------------------------------------------------------
+
+# Trailing noise: the Tata Neu credit marker, a foreign-amount pair, and a plain
+# terminal/reference number. The list is a PRIORITY order and is re-applied until
+# the string stops shrinking, because the order varies by issuer and each step can
+# expose the next: "BADUNG IDR 1751000.00 48" ends in a number whose removal exposes
+# the amount, so a single pass would either miss the amount or mistake it for the
+# reference. The marker must precede the digit rule, or "+ 176" loses its 176.
+_CARD_TAIL = (
+    re.compile(r"\s*\+\s*\d+\s*$"),                              # "+ 176"
+    re.compile(r"\s+(?:IDR|USD|EUR|GBP|AED|THB|SGD|MYR|JPY|CNY)\s*[\d,]+(?:\.\d+)?\s*$", re.I),
+    re.compile(r"\s+[\d,]{1,12}(?:\.\d+)?\s*$"),               # " 3732"
+)
+_CARD_MAX_TAIL_PASSES = 4
+
+# Suffixes observed on real statements, longest first so "NEW DELHI" wins over "DELHI".
+_CARD_CITIES = (
+    "NEW DELHI", "SAN FRANCISCO", "BENGALURU", "BANGALORE", "GURGAON", "NOIDA",
+    "MUMBAI", "PUNE", "DELHI", "COCHIN", "ERNAKULAM", "THANE", "LUDHIANA",
+    "CHENNAI", "HYDERABAD", "AHMEDABAD", "KOLKATA", "JAIPUR", "TRIVANDRUM",
+    "KOZHIKODE", "PATHANAMTH", "ALAPPUZHA", "LITHIRUVALLA", "DAPPALLI", "KOLLAM",
+    "LONAVALA", "BADUNG", "DENPASAR", "GIANYAR", "KUTA", "SEMINYAK",
+)
+_CARD_CITY_RE = re.compile(r"(?:%s)\s*$" % "|".join(re.escape(c) for c in _CARD_CITIES), re.I)
+
+
+def parse_card_descriptor(narration):
+    """
+    Splits a bare card descriptor into (merchant, city, reference).
+
+    Deliberately conservative: anything it cannot confidently read comes back as
+    `None`, because a wrong merchant is worse than a missing one - a wrong payee
+    would silently satisfy a merchant rule and mis-file the row. It returns the
+    merchant with its corporate suffix intact ("MAXWARE TECHNOLOGIES PRIV"), which
+    is what a merchant rule should match on anyway.
+    """
+    text = narration.strip()
+    if not text:
+        return None, None, None
+
+    ref = None
+    for _ in range(_CARD_MAX_TAIL_PASSES):
+        stripped = False
+        for pattern in _CARD_TAIL:
+            m = pattern.search(text)
+            if m and m.start() > 0:             # must leave a merchant behind
+                # Keep the first tail seen: that is the terminal/reference the
+                # issuer printed, the amount and the credit marker are noise.
+                ref = ref or m.group(0).strip()
+                text = text[: m.start()].strip()
+                stripped = True
+                break
+        if not stripped:
+            break
+
+    city = None
+    m = _CARD_CITY_RE.search(text)
+    if m and m.start() > 0:                     # must leave a merchant behind
+        city = m.group(0).strip().upper()
+        text = text[: m.start()].strip()
+
+    # A descriptor that is nothing but digits or punctuation carries no merchant.
+    if not text or not re.search(r"[A-Z]{3}", text.upper()):
+        return None, city, ref
+
+    return text.upper(), city, ref
+
+
 def parse_narration(narration, debit_amount=None, credit_amount=None):
     """
     Parses a single bank narration into structured components:
@@ -162,6 +249,17 @@ def parse_narration(narration, debit_amount=None, credit_amount=None):
     else:
         components["Transaction_Type"] = "OTHER"
         components["Details"] = narration
+        # A bare card descriptor ("MAXWARE TECHNOLOGIES PRIVBANGALORE 3732") has no
+        # prefix to split on, so the merchant has to come from the descriptor itself.
+        # Without this the payee stayed null, which disabled merchant rules,
+        # recurrence detection and the top-merchants chart for every card row.
+        payee, city, card_ref = parse_card_descriptor(narration)
+        if payee:
+            components["Payee_Receiver"] = payee
+            if city:
+                components["Remarks"] = city
+            if card_ref:
+                components["Reference_ID"] = card_ref
 
     has_debit = bool(debit_amount) and float(debit_amount) > 0
     has_credit = bool(credit_amount) and float(credit_amount) > 0

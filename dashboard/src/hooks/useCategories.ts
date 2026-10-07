@@ -1,6 +1,13 @@
 import useSWR from "swr";
 import api from "@/lib/api";
-import { CascadeMode, PreviewRuleResponse, ApplyCascadeRequest } from "@/types";
+import {
+  CascadeMode,
+  PreviewRuleResponse,
+  ApplyCascadeRequest,
+  DefinitionsResponse,
+  CategoryDefinition,
+  CategoryDirection,
+} from "@/types";
 import type {
   ApplyDirectionCascadeRequest,
   DirectionMode,
@@ -17,6 +24,14 @@ export interface CategoryRulePayload {
   category: string;
   /** Optional leaf. Omit to let the server derive one from the parent. */
   sub_category?: string | null;
+}
+
+export interface DefinitionPayload {
+  name: string;
+  description?: string | null;
+  examples?: string | null;
+  /** null clears the override and falls back to the code default. */
+  direction_override?: CategoryDirection | null;
 }
 
 export function useCategories() {
@@ -36,6 +51,34 @@ export function useCategories() {
     "/categories/sub",
     fetcher
   );
+
+  // What each category is *for*. Fetched here rather than in its own hook because
+  // the definitions editor and the suggestion prompt both need it, and it changes
+  // exactly when the category list does.
+  const { data: defData, mutate: mutateDefinitions } = useSWR<DefinitionsResponse>(
+    "/categories/definitions",
+    fetcher
+  );
+
+  const definitions: CategoryDefinition[] = defData?.definitions || [];
+
+  const upsertDefinition = async (payload: DefinitionPayload) => {
+    const res = await api.post("/categories/definitions", payload);
+    // A new category name is registered too, so both lists move together and the
+    // definition never describes a name the dropdown does not offer.
+    mutateDefinitions();
+    mutate();
+    mutateCustom();
+    return res.data as DefinitionsResponse;
+  };
+
+  const deleteDefinition = async (name: string) => {
+    const res = await api.delete(
+      `/categories/definitions/${encodeURIComponent(name)}`
+    );
+    mutateDefinitions();
+    return res.data;
+  };
 
   const addCategory = async (name: string) => {
     await api.post("/categories", { name });
@@ -126,6 +169,7 @@ export function useCategories() {
     categories: data || [],
     customCategories: customData || [],
     subCategories: subData || [],
+    definitions,
     isLoading,
     error,
     addCategory,
@@ -136,6 +180,9 @@ export function useCategories() {
     deleteRules,
     mutate,
     mutateSubs,
+    mutateDefinitions,
+    upsertDefinition,
+    deleteDefinition,
     listDirectionRules,
     previewDirection,
     applyDirectionCascade,

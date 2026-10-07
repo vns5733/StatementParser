@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.deps import get_engine
-from api.routers import transactions, categories, cards
+from api.routers import transactions, categories, cards, notes
 
 
 @asynccontextmanager
@@ -46,6 +46,10 @@ app.add_middleware(
 app.include_router(transactions.router, prefix="/api")
 app.include_router(categories.router, prefix="/api")
 app.include_router(cards.router, prefix="/api")
+# Two routers from one module: notes and LLM suggestions share the subject of a
+# single transaction, and accepting a suggestion writes both.
+app.include_router(notes.notes_router, prefix="/api")
+app.include_router(notes.llm_router, prefix="/api")
 
 
 @app.get("/api/health")

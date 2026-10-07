@@ -76,25 +76,38 @@ def _clean(text):
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def parse_amount(token, allow_credit_suffix=False):
+def parse_amount(token, allow_credit_suffix=False, allow_sign_prefix=False):
     """
     Turns an extracted amount token into a float.
 
-    Handles the three real shapes seen in the wild:
+    Handles the shapes seen in the wild:
         "1,455.00"     plain
         "C1,60.82"     HDFC, the ITFRupee glyph rendering as "C"
         "Rs445.00"     SCAPIA, rupee preserved
         "2,751.61 CR"  ICICI credit, which is money coming back
     Returns (amount, is_credit) or (None, False).
+
+    `allow_sign_prefix` accepts a leading "+" or "-" as the sign, which is how
+    Tata Neu marks a credit on recent statements: it prints "+ C 498.00" as its
+    own token, to the LEFT of the amount band. Without this that token parses to
+    None, the loop moves on to the bare "C 498.00", and the credit is read as a
+    DEBIT - so 12 of 27 statements recorded every payment as spend.
     """
     if token is None:
         return None, False
     raw = _clean(token)
     raw = raw.replace("₹", "").replace("Rs.", "").replace("Rs", "")
+    is_credit = False
+    if allow_sign_prefix:
+        # "+" is the issuer's credit marker; "-" is a reversal, still a debit.
+        if re.match(r"^\+", raw):
+            is_credit = True
+            raw = raw.lstrip("+")
+        elif re.match(r"^-", raw):
+            raw = raw.lstrip("-")
     # Only strip a leading "C" when it is the HDFC rupee glyph: a token that is
     # just "CR" is a credit marker, not an amount.
     raw = re.sub(rf"^{RUPEE_GLYPH}\s*(?=[\d])", "", raw)
-    is_credit = False
     if allow_credit_suffix:
         m = re.match(r"^(.*?)\s*(CR|CR\.)$", raw, re.IGNORECASE)
         if m:
@@ -255,12 +268,23 @@ def parse_hdfc_card(pdf):
             desc = _joined(desc_words)
 
             amount, is_credit = None, False
+            # Tata Neu prints a leading "+"/"-" as its OWN token, left of the
+            # value. It carries the credit flag and nothing else, so it must be
+            # read for that flag and then stepped over - trying to parse it as an
+            # amount returns None and the loop would fall through to the bare
+            # "C 498.00", turning every payment into a debit.
+            sign_credit = None
             for w in sorted((w for w in row
                              if bands["amount"][0] <= w["x0"] < bands["amount"][1]),
                             key=lambda w: w["x0"]):
-                value, credit = parse_amount(w["text"], allow_credit_suffix=True)
+                token = w["text"]
+                if token in ("+", "-"):
+                    sign_credit = token == "+"
+                    continue
+                value, credit = parse_amount(token, allow_credit_suffix=True)
                 if value is not None:
-                    amount, is_credit = value, credit
+                    amount = value
+                    is_credit = credit or bool(sign_credit)
                     break
             if not desc or amount is None:
                 continue

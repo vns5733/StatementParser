@@ -219,9 +219,17 @@ BANK_CC_PAYMENT = re.compile(r"(?i)CREDIT[_\s]*CARD[_\s]*PAYMENT")
 # this is "BPPY CC PAYMENT ... (Ref# ...)"; ICICI shows "BBPS Payment received"
 # with a CR marker. These must not be counted as spend, because the underlying
 # purchases are already in the ledger as card debits.
+#
+# NETBANKING TRANSFER / TELE TRANSFER CREDIT are the same event described
+# generically: the issuer banks the bill payment without naming the card. They
+# were missing here, so 65 rows worth 20.6L of real bill payments were left
+# unflagged - they surfaced as card INFLOW, and the combined view's settlement
+# exclusion could not remove them because they were never on the list.
 SETTLEMENT_RE = re.compile(
     r"(?i)\b(CC\s*PAYMENT|CARD\s*PAYMENT|BPPY|PREPAID\s*LOAD|TOP\s*UP|"
-    r"BBPS\s*PAYMENT\s*RECEIVED|PAYMENT\s*RECEIVED|REPAYMENT)\b"
+    r"BBPS\s*PAYMENT\s*RECEIVED|PAYMENT\s*RECEIVED|REPAYMENT|"
+    r"NETBANKING\s*TRANSFER|TELE\s*TRANSFER\s*CREDIT|"
+    r"NET\s*BANKING\s*TRANSFER|NEFT\s*TRANSFER|IB\s*TRANSFER)\b"
 )
 
 

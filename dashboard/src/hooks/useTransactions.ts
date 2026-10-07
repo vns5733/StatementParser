@@ -8,6 +8,7 @@ import {
   CategoryBreakdownEntry,
   BalanceTrendEntry,
   CategoryTrendEntry,
+  InsightsResponse,
   Meta,
   Filters,
   GroupBy,
@@ -94,6 +95,12 @@ export function useBalanceTrend(filters: Filters, enabled = true) {
   const key = enabled ? `/transactions/balance-trend?${query(bankOnly)}` : null;
   const { data, error, isLoading } = useSWR<BalanceTrendEntry[]>(key, fetcher);
   return { balanceTrend: data || [], error, isLoading };
+}
+
+export function useInsights(filters: Filters, enabled = true) {
+  const key = enabled ? `/transactions/insights?${query(filters)}` : null;
+  const { data, error, isLoading, mutate } = useSWR<InsightsResponse>(key, fetcher);
+  return { insights: data, error, isLoading, mutate };
 }
 
 export function useCategoryTrend(

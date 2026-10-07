@@ -53,7 +53,7 @@ export default function CategoryMonthlyTable({
 
   if (isLoading) {
     return (
-      <div className="glass-panel" style={{ padding: "20px", marginTop: "16px" }}>
+<div className="glass-panel" style={{ padding: "20px" }}>
         <div style={{ padding: "30px 0", textAlign: "center", color: "var(--text-muted)" }}>
           Loading monthly breakdown...
         </div>

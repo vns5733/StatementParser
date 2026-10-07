@@ -9,15 +9,7 @@ import {
   useIssuerCategoryStats,
   useReconcile,
 } from "@/hooks/useCards";
-import CreditCardAnalytics from "@/components/CreditCardAnalytics";
-import type {
-  ApplyCascadeRequest,
-  CardSpendEntry,
-  CascadeMode,
-  Filters,
-  Meta,
-  PreviewRuleResponse,
-} from "@/types";
+import type { ApplyCascadeRequest, CardSpendEntry, CascadeMode, PreviewRuleResponse } from "@/types";
 
 /**
  * Credit-card panel: which cards exist, how the issuer's own printed cycle total
@@ -28,16 +20,18 @@ import type {
  * still have lost rows, and the only way to see that is to compare the sum of
  * the parsed rows against the total the issuer printed.
  *
- * The "Overview" sub-tab is the card equivalent of the bank statement view
- * (KPIs, inflow/outflow timeline, category breakdown, drill-down). It reuses
- * the shared ledger rather than re-deriving card aggregates, so the two views
- * always report the same purchase with the same category.
+ * Card *spend* is deliberately absent. It used to open with an "Overview" sub-tab
+ * that was the bank Overview tab with `accountSources=CREDIT_CARD` injected —
+ * seven shared components with a filter applied. That is now the Overview tab with
+ * the sidebar's Spend Basis set to Card, so there is one implementation and the
+ * two views cannot disagree. What is left here is what the shared bank schema has
+ * no column for: the issuer's printed totals, its own category, and the match
+ * between a bill and the bank debit that paid it.
  */
-type Tab = "overview" | "cards" | "spend" | "reconcile";
+type Tab = "statements" | "spend" | "reconcile";
 
 const TABS: { key: Tab; label: string }[] = [
-  { key: "overview", label: "Overview" },
-  { key: "cards", label: "Cards & Statements" },
+  { key: "statements", label: "Cards & Statements" },
   { key: "spend", label: "Spend by Category" },
   { key: "reconcile", label: "Bank Reconciliation" },
 ];
@@ -70,28 +64,25 @@ function varianceColor(v: number | null): string {
 }
 
 interface CreditCardsPanelProps {
-  /** Sidebar filters, so the card view respects the same year/month/category scope. */
-  filters: Filters;
-  meta: Meta | undefined;
-  categories: string[];
-  subCategories: string[];
   onPreviewRule: (mode: CascadeMode, key: string) => Promise<PreviewRuleResponse>;
   onApplyCascade: (request: ApplyCascadeRequest) => Promise<any>;
   onRefresh: () => void;
 }
 
+/**
+ * Takes no filters, deliberately. Everything here is read from the card tables
+ * rather than the shared transaction ledger, so a year/month/category scope has
+ * nothing to narrow — reconciliation must see every statement on record, since
+ * an unmatched cycle is exactly the thing the check exists to find.
+ */
 export default function CreditCardsPanel({
-  filters,
-  meta,
-  categories,
-  subCategories,
   onPreviewRule,
   onApplyCascade,
   onRefresh,
 }: CreditCardsPanelProps) {
-  // "overview" is the default: it is the card equivalent of the bank statement
-  // view, and the other three sub-tabs are the card-specific detail behind it.
-  const [tab, setTab] = useState<Tab>("overview");
+  // Statements first: the card registry is what this whole tab is about, and it
+  // is the only sub-tab with an independent check on the parser.
+  const [tab, setTab] = useState<Tab>("statements");
   const { cards, isLoading: loadingCards } = useCards();
   const { cardStatements } = useCardStatements();
   const { cardSpend } = useCardSpend();
@@ -128,10 +119,8 @@ export default function CreditCardsPanel({
     };
   }, [cardStatements]);
 
-  // The registry loading/empty states only gate the three card-detail sub-tabs.
-  // "overview" reads the shared ledger, so it has its own empty state and must
-  // stay reachable (and switchable away from) in both cases — otherwise the tab
-  // strip would vanish along with the content and trap the user.
+  // Every sub-tab here reads the card registry, so its loading and empty states
+  // gate all of them.
   const registryPending = loadingCards;
   const registryEmpty = !loadingCards && cards.length === 0;
 
@@ -184,19 +173,7 @@ export default function CreditCardsPanel({
         </div>
       </div>
 
-      {tab === "overview" && (
-        <CreditCardAnalytics
-          baseFilters={filters}
-          meta={meta}
-          categories={categories}
-          subCategories={subCategories}
-          onPreviewRule={onPreviewRule}
-          onApplyCascade={onApplyCascade}
-          onRefresh={onRefresh}
-        />
-      )}
-
-      {tab !== "overview" && registryPending && (
+      {registryPending && (
         <div className="glass-panel" style={{ padding: "20px" }}>
           <p style={{ color: "var(--text-muted)", fontSize: "0.875rem" }}>
             Loading credit cards…
@@ -204,7 +181,7 @@ export default function CreditCardsPanel({
         </div>
       )}
 
-      {tab !== "overview" && registryEmpty && (
+      {registryEmpty && (
         <div className="glass-panel" style={{ padding: "20px" }}>
           <p style={{ color: "var(--text-primary)", fontWeight: 700, fontSize: "1.1rem" }}>
             No card detail available
@@ -215,14 +192,18 @@ export default function CreditCardsPanel({
             to import the PDFs in the{" "}
             <code style={{ color: "var(--text-secondary)" }}>CreditCard/</code> folder.
           </p>
+          <p style={{ color: "var(--text-muted)", fontSize: "0.8rem", marginTop: "10px" }}>
+            Card spend is charted on the Overview tab — set the sidebar's Spend Basis to{" "}
+            <strong>Card</strong>.
+          </p>
         </div>
       )}
 
-      {/* The three detail sub-tabs. All read the card registry directly, so they
-          are gated on it having loaded; the overview above is independent. */}
+      {/* The three sub-tabs. All read the card registry directly, so they are
+          gated on it having loaded. */}
       {!registryPending && !registryEmpty && (
       <>
-      {tab === "cards" && (
+      {tab === "statements" && (
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.875rem" }}>
             <thead>

@@ -13,12 +13,27 @@ import {
 } from "recharts";
 import { TimelineEntry, GroupBy } from "@/types";
 import { formatCurrency, formatCompactCurrency } from "@/lib/formatters";
+import { legendLabel, legendValue } from "@/lib/legend";
+
+/** Maps a Recharts series key onto the `direction` filter value. */
+function directionOf(series: string): "debits" | "credits" {
+  return series === "Total_Credit" ? "credits" : "debits";
+}
 
 interface TimelineChartProps {
   data: TimelineEntry[];
   groupBy: GroupBy;
   onChangeGroupBy: (g: GroupBy) => void;
   isLoading?: boolean;
+  /**
+   * Called with "credits" or "debits" when a legend entry is clicked. Inflow
+   * and outflow are not two series to inspect side by side — the question is
+   * usually "show me only the money out", which the direction filter answers for
+   * every panel at once.
+   */
+  onSelectDirection?: (direction: "debits" | "credits") => void;
+  /** The active direction, so the legend shows which one is applied. */
+  activeDirection?: "all" | "debits" | "credits";
 }
 
 export default function TimelineChart({
@@ -26,6 +41,8 @@ export default function TimelineChart({
   groupBy,
   onChangeGroupBy,
   isLoading,
+  onSelectDirection,
+  activeDirection = "all",
 }: TimelineChartProps) {
   const CustomTooltip = ({ active, payload, label }: any) => {
     if (active && payload && payload.length) {
@@ -65,7 +82,7 @@ export default function TimelineChart({
   };
 
   return (
-    <div className="glass-panel" style={{ padding: "20px", marginBottom: "24px" }}>
+    <div className="glass-panel" style={{ padding: "20px" }}>
       <div style={{
         display: "flex",
         justifyContent: "space-between",
@@ -148,11 +165,20 @@ export default function TimelineChart({
               <Tooltip content={<CustomTooltip />} />
               <Legend
                 wrapperStyle={{ paddingTop: "10px" }}
-                formatter={(value) => (
-                  <span style={{ color: "var(--text-secondary)", fontSize: "0.85rem" }}>
-                    {value === "Total_Credit" ? "Credit (Inflow)" : "Debit (Outflow)"}
-                  </span>
-                )}
+                onClick={
+                  onSelectDirection
+                    ? (entry: any) => onSelectDirection(directionOf(legendValue(entry)))
+                    : undefined
+                }
+                formatter={(value) =>
+                  legendLabel(
+                    String(value),
+                    directionOf(String(value)) === "credits"
+                      ? "Credit (Inflow)"
+                      : "Debit (Outflow)",
+                    activeDirection === directionOf(String(value))
+                  )
+                }
               />
               <Bar
                 dataKey="Total_Credit"

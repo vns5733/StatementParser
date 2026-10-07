@@ -13,17 +13,29 @@ import {
 } from "recharts";
 import { CategoryTrendEntry } from "@/types";
 import { formatCurrency, formatCompactCurrency } from "@/lib/formatters";
+import { legendLabel, legendValue } from "@/lib/legend";
+
+/** Maps a Recharts series key onto the `direction` filter value. */
+function directionOf(series: string): "debits" | "credits" {
+  return series === "Total_Credit" ? "credits" : "debits";
+}
 
 interface CategoryTrendChartProps {
   data: CategoryTrendEntry[];
   category: string;
   isLoading?: boolean;
+  /** Called with "credits" or "debits" when a legend entry is clicked. */
+  onSelectDirection?: (direction: "debits" | "credits") => void;
+  /** The active direction, so the legend shows which one is applied. */
+  activeDirection?: "all" | "debits" | "credits";
 }
 
 export default function CategoryTrendChart({
   data,
   category,
   isLoading,
+  onSelectDirection,
+  activeDirection = "all",
 }: CategoryTrendChartProps) {
   const CustomTooltip = ({ active, payload, label }: any) => {
     if (active && payload && payload.length) {
@@ -54,7 +66,7 @@ export default function CategoryTrendChart({
   };
 
   return (
-    <div className="glass-panel" style={{ padding: "20px", marginBottom: "24px" }}>
+    <div className="glass-panel" style={{ padding: "20px" }}>
       <div style={{ marginBottom: "16px" }}>
         <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--text-primary)" }}>
           {category} — Monthly Trend
@@ -82,11 +94,20 @@ export default function CategoryTrendChart({
               <Tooltip content={<CustomTooltip />} />
               <Legend
                 wrapperStyle={{ paddingTop: "10px" }}
-                formatter={(val) => (
-                  <span style={{ color: "var(--text-secondary)", fontSize: "0.85rem" }}>
-                    {val === "Total_Debit" ? "Debit (Outflow)" : "Credit (Inflow)"}
-                  </span>
-                )}
+                onClick={
+                  onSelectDirection
+                    ? (entry: any) => onSelectDirection(directionOf(legendValue(entry)))
+                    : undefined
+                }
+                formatter={(val) =>
+                  legendLabel(
+                    String(val),
+                    directionOf(String(val)) === "credits"
+                      ? "Credit (Inflow)"
+                      : "Debit (Outflow)",
+                    activeDirection === directionOf(String(val))
+                  )
+                }
               />
               <Line
                 type="monotone"

@@ -8,8 +8,14 @@ from narration_parser import parse_narrations_dataframe
 from category_rules import (
     BUILTIN_CATEGORIES,
     BUILTIN_SUB_CATEGORIES,
+    CATEGORY_SPECS,
+    CATEGORY_DIRECTION,
+    DIRECTION_BOTH,
+    DIRECTION_VALUES,
     PAYEE_CATEGORY_MAP,
+    apply_direction_awareness,
     assign_sub_category,
+    category_direction,
     parent_category,
 )
 from config import (
@@ -22,6 +28,7 @@ from config import (
     TABLE_NARRATION_DETAILS,
     TABLE_CREDIT_CARDS,
     TABLE_DIRECTION_RULES,
+    TABLE_TRANSACTION_NOTES,
 )
 
 # Card tables live in their own module so the bank-ledger code above stays
@@ -46,6 +53,10 @@ _CACHE_LOCK = threading.RLock()  # reentrant: cache fills call each other
 _base_df_cache = None
 _final_df_cache = None
 _rules_cache = None
+# User-editable per-category direction, read from category_definitions. Kept
+# apart from _rules_cache because a different endpoint writes it (the definitions
+# editor) and a different invalidator drops it.
+_direction_override_cache = None
 
 # Recurrence detection thresholds: a payee must repeat at least this many times,
 # with a median gap no larger than this, to be treated as recurring.
@@ -229,9 +240,50 @@ def init_db_tables(engine, seed=True):
         """)
         )
 
+        # Free-text notes the user attaches to a transaction, plus the last
+        # suggestion an LLM made for it. Keyed on Chq_Ref_Number like every other
+        # per-transaction table, so it survives a re-import of the same statement
+        # (which is INSERT IGNORE) and is not touched by recategorize_all_narrations
+        # (which only rewrites narration_details).
+        connection.execute(
+            text(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_TRANSACTION_NOTES} (
+                Chq_Ref_Number VARCHAR(250) PRIMARY KEY,
+                Note TEXT,
+                Source VARCHAR(20) NULL,
+                Suggestion TEXT NULL,
+                Updated_At DATETIME NULL,
+                FOREIGN KEY (Chq_Ref_Number)
+                    REFERENCES {TABLE_TRANSACTIONS}(Chq_Ref_Number)
+            );
+            """)
+        )
+
+        # What each category is *for*, in the user's own words.
+        #
+        # Direction lives here only as an OVERRIDE; the authoritative value is in
+        # code (category_rules.CATEGORY_DIRECTION), because the direction
+        # reconciler needs it while classifying and there is no database in that
+        # path. A non-null direction_override here wins over the code default at
+        # read time, which is how a user re-points a category without a code
+        # change.
+        connection.execute(
+            text("""
+            CREATE TABLE IF NOT EXISTS category_definitions (
+                name VARCHAR(50) PRIMARY KEY,
+                description TEXT NULL,
+                examples TEXT NULL,
+                direction_override VARCHAR(10) NULL,
+                is_builtin TINYINT DEFAULT 0,
+                updated_at DATETIME NULL
+            );
+            """)
+        )
+
         if seed:
             _seed_broad_categories(connection)
             _seed_category_rules(connection)
+            _seed_category_definitions(connection)
 
         _migrate_renamed_categories(connection)
 
@@ -244,14 +296,18 @@ def init_db_tables(engine, seed=True):
 
 
 # Renames applied to all existing data at every init (self-healing).
-# Investment_Liquidation was folded into Investment: the two were the same
-# platforms split only by transaction direction, which made "what did I invest?"
-# unanswerable without combining two categories by hand.
+#
+# `Investment_Liquidation` was REMOVED from this map. It used to fold into
+# `Investment`, on the reasoning that the two were the same platforms split only
+# by direction and merging them was what made "what did I invest?" answerable.
+# That merge is why a Groww payout read as money invested. Both categories roll up
+# to Financial, so splitting them changes what a row is called without changing
+# what any rollup adds up to, and leaving the entry in would have undone the split
+# on every single startup.
 CATEGORY_RENAMES = {
     "Business_Income": "Non_Salary_Income",
     "Mobile_Recharge": "Utilities_Bills",
     "Broadband_Internet": "Utilities_Bills",
-    "Investment_Liquidation": "Investment",
 }
 
 
@@ -274,12 +330,30 @@ def _migrate_renamed_categories(connection):
             {"n": new_name, "o": old_name},
         )
         connection.execute(
-            text("UPDATE category_rules SET sub_category = :n WHERE sub_category = :o"),
-            {"n": new_name, "o": old_name},
-        )
-        connection.execute(
             text("DELETE FROM broad_categories WHERE name = :o"),
             {"o": old_name},
+        )
+
+
+def _seed_category_definitions(connection):
+    """
+    Seeds category_definitions from category_rules.CATEGORY_SPECS with INSERT
+    IGNORE, so an existing row is never overwritten.
+
+    That is the whole point: these are the user's words about a category, and a
+    code change must not silently revert an edit. A spec added to CATEGORY_SPECS
+    later still lands, because the row does not exist yet. direction_override is
+    deliberately NOT seeded - seeding it would pin every category to its code
+    default and make the override column permanently dead.
+    """
+    for name, spec in CATEGORY_SPECS.items():
+        connection.execute(
+            text("""
+                INSERT IGNORE INTO category_definitions
+                    (name, description, examples, direction_override, is_builtin, updated_at)
+                VALUES (:n, :d, :e, NULL, 1, NOW())
+            """),
+            {"n": name, "d": spec.get("description"), "e": spec.get("examples")},
         )
 
 
@@ -371,6 +445,32 @@ def _mark_recurring(df):
     return df
 
 
+def _card_side_settlement_mask(df):
+    """
+    True for the CARD half of a bank<->card settlement: a row on the credit-card
+    ledger whose narration names a payment.
+
+    Shared by _mark_settlement and _apply_direction_awareness on purpose. The two
+    must agree exactly, because awareness has to be able to ask "is this row a
+    settlement?" without relying on Is_Settlement — which does not exist yet at
+    that point in the pipeline, since settlement is marked after awareness (a
+    refund reconciled into Card_Refund must not be mistaken for a bill payment).
+    Duplicating the pattern instead of sharing it is how the two would drift.
+    """
+    if df.empty or "Account_Source" not in df.columns:
+        return pd.Series(False, index=df.index)
+
+    source = df["Account_Source"].fillna("BANK").astype(str).str.upper()
+    narration = _upper_series(df, "Narration")
+    if narration is None:
+        return pd.Series(False, index=df.index)
+
+    # SETTLEMENT_RE is an inline-flag regex; the pattern is used, not its capture
+    # groups, so pandas' group warning is expected and harmless.
+    card_side = narration.str.contains(SETTLEMENT_RE, regex=True, na=False)
+    return (source == "CREDIT_CARD") & card_side
+
+
 def _mark_settlement(df):
     """
     Flags rows that move money between the bank and a card rather than spending
@@ -387,42 +487,164 @@ def _mark_settlement(df):
     Derived at read time, like `is_recurring`, so it stays correct as statements
     are re-imported without a migration.
 
-    Must be called on the frame whose Broad_Category has already had the
-    category_rules overrides applied - i.e. after _apply_category_rule_overrides,
-    not on the base JOIN. The bank-side test reads that column, so running this
-    earlier would only see the parser's category and miss any row a rule
-    reclassified (see Decision 24). _mark_recurring has no such constraint: it
-    reads Payee_Receiver/Date, which no rule changes.
+    Must be called on the frame whose Broad_Category has already had the category
+    rules AND the direction reconciliation applied - i.e. after
+    _apply_category_rule_overrides and after _apply_direction_awareness. The
+    bank-side test reads that column, so running this earlier would only see the
+    stored category, miss any row a rule reclassified, and count a card refund as
+    the bill payment it is not (see Decision 24 and Decision 37).
+    _mark_recurring has no such constraint: it reads Payee_Receiver/Date, which
+    no rule changes.
     """
     df["Is_Settlement"] = False
     if df.empty:
         return df
 
-    source = (
-        df["Account_Source"].fillna("BANK").astype(str).str.upper()
-        if "Account_Source" in df.columns
-        else pd.Series("BANK", index=df.index)
-    )
-    narration = _upper_series(df, "Narration")
     broad = _upper_series(df, "Broad_Category")
-
-    card_side = (
-        # SETTLEMENT_RE is an inline-flag regex; the pattern is used, not its
-        # capture groups, so pandas' group warning is expected and harmless.
-        narration.str.contains(SETTLEMENT_RE, regex=True, na=False)
-        if narration is not None
-        else pd.Series(False, index=df.index)
-    )
+    # Matched on separators as well as underscores so a renamed or
+    # user-created variant ("Credit Card Payment", "CreditCardPayment")
+    # is still recognised as the bank half of a settlement.
     bank_side = (
-        # Matched on separators as well as underscores so a renamed or
-        # user-created variant ("Credit Card Payment", "CreditCardPayment")
-        # is still recognised as the bank half of a settlement.
         broad.str.contains(r"CREDIT[\s_]*CARD[\s_]*PAYMENT", regex=True, na=False)
         if broad is not None
         else pd.Series(False, index=df.index)
     )
 
-    df["Is_Settlement"] = ((source == "CREDIT_CARD") & card_side) | bank_side
+    df["Is_Settlement"] = _card_side_settlement_mask(df) | bank_side
+    return df
+
+
+def _load_direction_overrides(engine):
+    """
+    User-editable direction per category, from category_definitions.
+
+    Returned as {name: 'IN'|'OUT'|'BOTH'} containing ONLY the names that have an
+    explicit override, because category_direction falls back to the code-level map
+    for anything absent. Cached alongside the other rules because it feeds the
+    final-frame build, so re-reading it per request would defeat the point.
+    """
+    global _direction_override_cache
+    if _direction_override_cache is not None:
+        return _direction_override_cache
+
+    overrides = {}
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text("""
+                    SELECT name, direction_override
+                    FROM category_definitions
+                    WHERE direction_override IS NOT NULL
+                      AND direction_override <> ''
+                """)
+            ).fetchall()
+        for name, value in rows:
+            token = str(value or "").strip().upper()
+            if token in DIRECTION_VALUES:
+                overrides[str(name)] = token
+    except Exception:
+        # A missing table (first run before migration) simply means no overrides.
+        overrides = {}
+
+    _direction_override_cache = overrides
+    return overrides
+
+
+def _apply_direction_awareness(df, engine):
+    """
+    Reconciles every row's category against the side its money actually moved, and
+    records the result in three columns:
+
+      Category_Direction  - the direction the category is about (IN / OUT / BOTH)
+      Direction_Mismatch  - True when the row's amount side disagrees with that
+      Direction_Reclassified - the category it was BEFORE this correction, so the
+                            UI can say what changed rather than presenting a label
+                            the parser never produced
+
+    Runs AFTER _apply_direction_overrides, and that ordering is the whole point:
+    a direction rule moves the amount between Debit_Amount and Credit_Amount, so a
+    row flipped from debit to credit is only discoverable as a mismatch once the
+    flip has happened. Running earlier would compare against the amount the user
+    explicitly corrected away from. This is the same lesson as Decision 24 — a
+    derived column that reads another derived column has to come after it.
+
+    Sub_Category is re-derived only for rows whose parent actually changed.
+    Otherwise a Groww sale would keep the Mutual_Fund leaf it picked up while it
+    was still an Investment debit.
+    """
+    df["Category_Direction"] = DIRECTION_BOTH
+    df["Direction_Mismatch"] = False
+    df["Direction_Reclassified"] = None
+    df["Direction_Mismatch_Reason"] = None
+    if df.empty:
+        return df
+
+    overrides = _load_direction_overrides(engine)
+    debit = pd.to_numeric(df["Debit_Amount"], errors="coerce").fillna(0) > 0
+    credit = pd.to_numeric(df["Credit_Amount"], errors="coerce").fillna(0) > 0
+
+    # A settlement is not a refund and not a disbursement, whatever direction it
+    # runs. Excluding these rows is not a detail: 95 card-side credits printed as
+    # "NETBANKING TRANSFER" were being relabelled Credit_Card_Payment ->
+    # Card_Refund, which is the one thing Decision 27 went to some trouble to
+    # establish they are not. A settlement keeps whatever category it had.
+    settled = _card_side_settlement_mask(df)
+
+    categories = df["Broad_Category"].fillna("Uncategorized").astype(str)
+
+    # Two series, because they answer different questions: `recat` is where the row
+    # now IS, `from_cat` is where it was. Masking Broad_Category with `from_cat`
+    # would put the old value straight back — a reclassification that reclassifies
+    # nothing, which is exactly what it looked like.
+    recat = pd.Series([None] * len(df), index=df.index, dtype=object)
+    from_cat = pd.Series([None] * len(df), index=df.index, dtype=object)
+    mismatch = pd.Series(False, index=df.index)
+    reasons = pd.Series([None] * len(df), index=df.index, dtype=object)
+
+    for idx in df.index:
+        if settled.at[idx]:
+            continue
+        has_debit, has_credit = bool(debit.at[idx]), bool(credit.at[idx])
+        new_cat, reason, corrected_from = apply_direction_awareness(
+            df.at[idx, "Broad_Category"], has_debit, has_credit, direction_map=overrides
+        )
+        if corrected_from:
+            recat.at[idx] = new_cat
+            from_cat.at[idx] = corrected_from
+        elif reason:
+            mismatch.at[idx] = True
+            reasons.at[idx] = reason
+
+    df["Broad_Category"] = categories.mask(recat.notna(), recat)
+
+    if recat.notna().any():
+        changed = recat.notna()
+        # Re-derive the leaf from the NEW parent, but only where the parent moved,
+        # so an unchanged row keeps whatever leaf the override layer resolved.
+        for idx in df.index[changed]:
+            df.at[idx, "Sub_Category"] = assign_sub_category(
+                df.at[idx, "Broad_Category"],
+                df.at[idx, "Narration"],
+                df.at[idx, "Details"],
+                df.at[idx, "Payee_Receiver"],
+                df.at[idx, "Reference_ID"],
+            )
+
+    # Derived last, from the category each row ACTUALLY ended up in. Computing it
+    # before the reclassification left every reclassified row advertising the
+    # direction of the category it used to be, so Card_Refund reported OUT and
+    # every invariant test against it failed.
+    df["Category_Direction"] = pd.Series(
+        [category_direction(c, overrides) for c in df["Broad_Category"]],
+        index=df.index,
+    )
+    # The rollup parent follows the category, or a reclassified row keeps the
+    # parent of the category it no longer is.
+    df["Category"] = df["Broad_Category"].map(parent_category)
+
+    df["Direction_Mismatch"] = mismatch
+    df["Direction_Mismatch_Reason"] = reasons
+    df["Direction_Reclassified"] = from_cat
     return df
 
 
@@ -453,12 +675,18 @@ def _query_transactions_with_details(engine):
             n.Broad_Category,
             n.Sub_Category,
             c.Card_Name,
-            c.Issuer AS Card_Issuer
+            c.Issuer AS Card_Issuer,
+            nt.Note,
+            nt.Source AS Note_Source,
+            nt.Suggestion,
+            nt.Updated_At AS Note_Updated_At
         FROM {TABLE_TRANSACTIONS} t
         LEFT JOIN {TABLE_NARRATION_DETAILS} n
             ON t.Chq_Ref_Number = n.Chq_Ref_Number
         LEFT JOIN {TABLE_CREDIT_CARDS} c
             ON t.Card_ID = c.Card_ID
+        LEFT JOIN {TABLE_TRANSACTION_NOTES} nt
+            ON t.Chq_Ref_Number = nt.Chq_Ref_Number
         ORDER BY t.Date ASC, t.Chq_Ref_Number ASC;
     """
     with engine.connect() as connection:
@@ -525,18 +753,23 @@ def _get_cached_final_df(engine):
                 # Rollup parent, derived from the *resolved* broad category so the
                 # hierarchy always reflects the user's overrides.
                 df["Category"] = df["Broad_Category"].map(parent_category)
-                # Settlement must be marked HERE, not in the base query: its bank
-                # side is detected by matching the resolved Broad_Category against
-                # CREDIT_CARD_PAYMENT. Marking it earlier used the *stored* category,
-                # so any row that only became Credit_Card_Payment through a user
-                # override rule (a `narration` or `merchant` rule) escaped the flag
-                # and was counted as spend in every chart - double counting the very
-                # card purchases settlement exclusion exists to remove.
-                _mark_settlement(df)
-                # Direction decides which amount column a row lands in, so it must
-                # be resolved here — before any endpoint sums Debit_Amount or
-                # Credit_Amount. See _apply_direction_overrides.
+
+                # Order matters here, and the dependency chain is the reason:
+                #
+                #   direction overrides -> direction awareness -> settlement
+                #
+                # Direction has to be resolved first because awareness compares a
+                # category against the side its money moved, and a direction rule
+                # is what decides that side (Decision 28). Awareness then has to
+                # come before settlement, because settlement's bank-side test
+                # matches on Broad_Category - and a card refund reconciled into
+                # Card_Refund is no longer a card bill payment. Marking settlement
+                # first let a refund be excluded from spend as though it were the
+                # payment, deleting it from the totals instead of counting it as
+                # money back.
                 _apply_direction_overrides(engine, df)
+                _apply_direction_awareness(df, engine)
+                _mark_settlement(df)
                 _final_df_cache = df
         return _final_df_cache
 
@@ -560,10 +793,25 @@ def invalidate_rules_cache():
         _final_df_cache = None
 
 
+def invalidate_direction_override_cache():
+    """
+    Drops the user-editable per-category direction map and the frame built from it.
+
+    Separate from invalidate_rules_cache because a definitions edit touches neither
+    the rules nor the stored data — but it does change which rows get flagged as a
+    mismatch, so the frame built on top of it is stale.
+    """
+    global _direction_override_cache, _final_df_cache
+    with _CACHE_LOCK:
+        _direction_override_cache = None
+        _final_df_cache = None
+
+
 def invalidate_caches():
     """Drops both caches."""
     invalidate_transaction_cache()
     invalidate_rules_cache()
+    invalidate_direction_override_cache()
 
 
 def get_all_transactions_with_details(engine):
@@ -674,6 +922,49 @@ def get_category_summary(engine):
     return summary
 
 
+def _restore_issuer_categories(narr_df, issuer_cat, narration_map=None):
+    """
+    Re-applies the card issuer's own classification over a freshly parsed frame.
+
+    Mirrors what ingest_cards.py does at import time: the issuer's category wins,
+    and the Sub_Category leaf is re-derived from it so the two levels cannot
+    disagree. Mutates `narr_df` in place; returns the number of rows corrected.
+    """
+    if issuer_cat is None or issuer_cat.empty:
+        return 0
+
+    from category_rules import assign_sub_category
+
+    mapping = dict(zip(
+        issuer_cat["Chq_Ref_Number"].astype(str),
+        issuer_cat["Statement_Category"].astype(str).str.strip(),
+    ))
+    refs = narr_df["Chq_Ref_Number"].astype(str)
+    mask = refs.isin(mapping.keys())
+    if not mask.any():
+        return 0
+
+    narr_df.loc[mask, "Broad_Category"] = refs[mask].map(mapping)
+    # assign_sub_category wants the ORIGINAL narration, and narration_details has no
+    # such column - only the parsed Details. Fall back to Details, which for a card
+    # descriptor is the narration verbatim.
+    if narration_map is None:
+        narrations = narr_df["Details"].fillna("")
+    else:
+        narrations = refs.map(narration_map).fillna(narr_df["Details"].fillna(""))
+    narr_df.loc[mask, "Sub_Category"] = [
+        assign_sub_category(broad, narr, d, p, r)
+        for broad, narr, d, p, r in zip(
+            narr_df.loc[mask, "Broad_Category"],
+            narrations[mask],
+            narr_df.loc[mask, "Details"].fillna(""),
+            narr_df.loc[mask, "Payee_Receiver"].fillna(""),
+            narr_df.loc[mask, "Reference_ID"].fillna(""),
+        )
+    ]
+    return int(mask.sum())
+
+
 def recategorize_all_narrations(engine):
     """
     Re-parses all existing transaction narrations using the current narration_parser rules
@@ -697,9 +988,39 @@ def recategorize_all_narrations(engine):
         )
         old_counts = dict(zip(old_type_dist["cat"], old_type_dist["cnt"])) if not old_type_dist.empty else {}
 
+        # Issuer-supplied card categories, read BEFORE the rewrite. The parser only
+        # sees the narration text, so it cannot know the card network classified the
+        # purchase itself, and Design Decision 18 gives that value precedence over
+        # keyword guessing. Recategorising without restoring it silently downgraded
+        # every issuer-classified row to whatever the merchant string implied - on
+        # the development data that turned one row from the issuer's Utilities_Bills
+        # into Shopping_Retail purely because the descriptor began "AMAZON". The
+        # 18 Groceries rows happened to survive only because the description also
+        # contained the word GROCERY; nothing was protecting them.
+        try:
+            issuer_cat = pd.read_sql(
+                text("""SELECT Ledger_Chq_Ref AS Chq_Ref_Number, Statement_Category
+                        FROM credit_card_transactions
+                        WHERE Statement_Category IS NOT NULL
+                          AND Statement_Category <> ''
+                          AND Ledger_Chq_Ref IS NOT NULL"""),
+                con=connection,
+            )
+        except Exception:
+            # Card tables absent (a bank-only database). Nothing to restore.
+            issuer_cat = pd.DataFrame(columns=["Chq_Ref_Number", "Statement_Category"])
+
         connection.execute(text(f"DELETE FROM {TABLE_NARRATION_DETAILS}"))
 
     new_narr_df = parse_narrations_dataframe(tx_df)
+
+    if not issuer_cat.empty:
+        _restore_issuer_categories(
+            new_narr_df,
+            issuer_cat,
+            narration_map=dict(zip(tx_df["Chq_Ref_Number"].astype(str),
+                                   tx_df["Narration"].fillna("").astype(str))),
+        )
 
     new_narr_df.to_sql(
         TABLE_NARRATION_DETAILS,
@@ -1175,6 +1496,278 @@ def delete_direction_rules(engine, rule_type, rule_keys):
     return deleted
 
 
+# ---------------------------------------------------------------------------
+# Transaction notes
+#
+# Notes are stored per transaction rather than derived, so this is the one place a
+# write is neither a rule nor a re-parse: it is user data that has to survive both.
+# ---------------------------------------------------------------------------
+
+def get_notes(engine, chq_refs=None):
+    """
+    Returns {Chq_Ref_Number: {note, source, suggestion, updated_at}} for the given
+    references, or an empty dict when chq_refs is None.
+
+    Read straight from the table rather than from the cached frame, because these
+    are the very endpoints that invalidate that cache — a reader sharing it would
+    be serving the frame the writer just dropped, and the user would watch their own
+    save fail to appear.
+    """
+    refs = [str(r).strip() for r in (chq_refs or []) if str(r or "").strip()]
+    if not refs:
+        return {}
+
+    placeholders = ",".join(f":r{i}" for i in range(len(refs)))
+    params = {f"r{i}": ref for i, ref in enumerate(refs)}
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(f"""
+                SELECT Chq_Ref_Number, Note, Source, Suggestion, Updated_At
+                FROM {TABLE_TRANSACTION_NOTES}
+                WHERE Chq_Ref_Number IN ({placeholders})
+            """),
+            params,
+        ).fetchall()
+
+    return {
+        str(row[0]): {
+            "note": row[1],
+            "source": row[2],
+            "suggestion": row[3],
+            "updated_at": row[4].isoformat() if hasattr(row[4], "isoformat") else row[4],
+        }
+        for row in rows
+    }
+
+
+def set_notes(engine, refs, note=None, suggestion=None, source="user"):
+    """
+    Writes one note across many transactions inside a single DB transaction.
+
+    `note=None` CLEARS the note on those references. An empty note and an absent
+    note are different states, and only one of them means "the user wrote nothing
+    here", so clearing removes the row rather than storing ''.
+
+    `suggestion` is stored separately from `note`, so the last thing the LLM
+    proposed for a row survives even when the user rejected it. Keeping the rejected
+    proposal is what lets the UI say "we suggested X, you kept Y" instead of
+    throwing away the machine's reasoning with nothing to show for it.
+
+    Returns the number of references written or cleared.
+
+    Unknown references are rejected rather than skipped. A note against a row that
+    does not exist is indistinguishable from a note that saved, and would surface
+    either later as a foreign-key error or not at all.
+    """
+    clean = [str(r).strip() for r in (refs or []) if str(r or "").strip()]
+    if not clean:
+        return 0
+
+    with engine.begin() as connection:
+        placeholders = ",".join(f":r{i}" for i in range(len(clean)))
+        params = {f"r{i}": ref for i, ref in enumerate(clean)}
+        known = {
+            str(row[0])
+            for row in connection.execute(
+                text(f"SELECT Chq_Ref_Number FROM {TABLE_TRANSACTIONS} "
+                     f"WHERE Chq_Ref_Number IN ({placeholders})"),
+                params,
+            ).fetchall()
+        }
+        unknown = [ref for ref in clean if ref not in known]
+        if unknown:
+            shown = ", ".join(unknown[:10])
+            raise ValueError(
+                f"Unknown transaction reference(s): {shown}"
+                + (f" (+{len(unknown) - 10} more)" if len(unknown) > 10 else "")
+            )
+
+        if note is None:
+            # Clearing keeps any stored suggestion, so the UI can still explain
+            # where the last machine proposal came from.
+            connection.execute(
+                text(f"""
+                    UPDATE {TABLE_TRANSACTION_NOTES}
+                    SET Note = NULL, Updated_At = NOW()
+                    WHERE Chq_Ref_Number IN ({placeholders}) AND Note IS NOT NULL
+                """),
+                params,
+            )
+            # ...then drop the rows that are now note-less AND never had a
+            # suggestion, so they stop shadowing the editor.
+            connection.execute(
+                text(f"DELETE FROM {TABLE_TRANSACTION_NOTES} "
+                     f"WHERE Chq_Ref_Number IN ({placeholders}) "
+                     f"AND Note IS NULL AND Suggestion IS NULL"),
+                params,
+            )
+            invalidate_transaction_cache()
+            return len(clean)
+
+        for ref in clean:
+            connection.execute(
+                text(f"""
+                    INSERT INTO {TABLE_TRANSACTION_NOTES}
+                        (Chq_Ref_Number, Note, Source, Suggestion, Updated_At)
+                    VALUES (:r, :n, :s, :g, NOW())
+                    ON DUPLICATE KEY UPDATE
+                        Note = VALUES(Note),
+                        Source = VALUES(Source),
+                        Suggestion = COALESCE(VALUES(Suggestion), Suggestion),
+                        Updated_At = NOW()
+                """),
+                {"r": ref, "n": note, "s": source, "g": suggestion},
+            )
+
+    # Notes are JOINed into the cached frame, so this is a data write, not a rules
+    # write: the cache is stale until it is dropped.
+    invalidate_transaction_cache()
+    return len(clean)
+
+
+def clear_notes(engine, refs):
+    """
+    Removes the note row outright for the given references, including any stored
+    suggestion. Returns the count. Returns 0 and touches nothing when the
+    references do not exist.
+    """
+    clean = [str(r).strip() for r in (refs or []) if str(r or "").strip()]
+    if not clean:
+        return 0
+    placeholders = ",".join(f":r{i}" for i in range(len(clean)))
+    params = {f"r{i}": ref for i, ref in enumerate(clean)}
+    with engine.begin() as connection:
+        result = connection.execute(
+            text(f"DELETE FROM {TABLE_TRANSACTION_NOTES} "
+                 f"WHERE Chq_Ref_Number IN ({placeholders})"),
+            params,
+        )
+        deleted = result.rowcount
+    invalidate_transaction_cache()
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# Category definitions
+# ---------------------------------------------------------------------------
+
+def get_category_definitions(engine):
+    """
+    Every category's definition, in display order, with the direction already
+    resolved against the user's override.
+
+    The registry (broad_categories) is the authority on WHICH names exist, so a
+    user-added category with no definition row still appears — reported as
+    undefined rather than omitted. Omitting it would make a custom category
+    invisible in the one screen whose entire job is to explain the categories.
+    """
+    with engine.connect() as connection:
+        def_rows = connection.execute(
+            text("""
+                SELECT name, description, examples, direction_override, is_builtin
+                FROM category_definitions
+            """)
+        ).fetchall()
+
+    definitions = {
+        str(r[0]): {
+            "description": r[1],
+            "examples": r[2],
+            "direction_override": r[3],
+            "is_builtin": bool(r[4]),
+        }
+        for r in def_rows
+    }
+    overrides = {k: v["direction_override"] for k, v in definitions.items()}
+
+    def sort_key(item):
+        name = item[0]
+        try:
+            return (0, BUILTIN_CATEGORIES.index(name), name)
+        except ValueError:
+            return (1, 0, name)
+
+    return [
+        {
+            "name": name,
+            "description": entry.get("description"),
+            "examples": entry.get("examples"),
+            "direction": category_direction(name, overrides),
+            "direction_override": entry.get("direction_override"),
+            "code_direction": CATEGORY_DIRECTION.get(name, DIRECTION_BOTH),
+            "is_builtin": entry.get("is_builtin", False),
+        }
+        for name, entry in sorted(definitions.items(), key=sort_key)
+    ]
+
+
+def upsert_category_definition(engine, name, description=None, examples=None,
+                               direction_override=None):
+    """
+    Creates or updates one category's definition and returns the full list.
+
+    The name is registered in broad_categories too if it is new, so defining a
+    category and using one are the same act from the user's side — a definition for
+    a name no dropdown offers is a note to self.
+
+    is_builtin is intentionally NOT overwritten on update. This table can reword a
+    built-in, but not demote it out of the protected set: is_builtin is what makes
+    DELETE /categories/{name} refuse to remove it.
+    """
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Category name cannot be empty")
+
+    override = str(direction_override or "").strip().upper() or None
+    if override and override not in DIRECTION_VALUES:
+        raise ValueError(
+            f"direction_override must be one of {', '.join(DIRECTION_VALUES)}"
+        )
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT IGNORE INTO broad_categories (name, is_builtin) VALUES (:n, 0)"),
+            {"n": clean_name},
+        )
+        connection.execute(
+            text("""
+                INSERT INTO category_definitions
+                    (name, description, examples, direction_override, is_builtin, updated_at)
+                VALUES (:n, :d, :e, :o, 0, NOW())
+                ON DUPLICATE KEY UPDATE
+                    description = VALUES(description),
+                    examples = VALUES(examples),
+                    direction_override = VALUES(direction_override),
+                    updated_at = NOW()
+            """),
+            {"n": clean_name, "d": description, "e": examples, "o": override},
+        )
+
+    invalidate_direction_override_cache()
+    return get_category_definitions(engine)
+
+
+def delete_category_definition(engine, name):
+    """
+    Removes one definition, leaving the category itself registered. Returns count.
+
+    Only the definition goes: the name is still referenced by rules and by stored
+    rows, and dropping the registry entry would break every dropdown that lists it.
+    A built-in's definition returns on the next init, seeded from CATEGORY_SPECS —
+    which is the right outcome, because a code-owned definition should not be
+    permanently deletable.
+    """
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        return 0
+    with engine.begin() as connection:
+        result = connection.execute(
+            text("DELETE FROM category_definitions WHERE name = :n"),
+            {"n": clean_name},
+        )
+        deleted = result.rowcount
+    invalidate_direction_override_cache()
+    return deleted
 def delete_category_rules(engine, rule_type, rule_keys):
     """
     Deletes override rules of the given type ('txn' | 'merchant' | 'narration')

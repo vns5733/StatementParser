@@ -12,6 +12,8 @@ import { useKPIs, useTransactions } from "@/hooks/useTransactions";
 import { useClampPage } from "@/hooks/useClampPage";
 import { formatCurrency, formatDate, formatNumber } from "@/lib/formatters";
 import CascadeModal, { PendingEdit } from "@/components/modals/CascadeModal";
+import SortableHeader from "@/components/tables/SortableHeader";
+import NoteCell from "@/components/tables/NoteCell";
 
 const CATEGORY_SELECT = {
   padding: "6px 10px",
@@ -35,6 +37,24 @@ interface DrilldownPanelProps {
   onPreviewRule: (mode: CascadeMode, key: string) => Promise<PreviewRuleResponse>;
   onApplyCascade: (request: ApplyCascadeRequest) => Promise<any>;
   onRefresh: () => void;
+  /**
+   * Persists a note against one transaction. Optional; supplying it adds the Note
+   * column. `page.tsx` passes the same writer it gives TransactionTable, so a
+   * note written here is the note that appears there.
+   */
+  onNoteSave?: (chqRef: string, note: string | null) => void;
+  /**
+   * Seeds for the three in-view filters. The panel owns these itself and layers
+   * them over `periodFilters`, so a scope that names one of them — the Insights
+   * channel drill-down sets `txnTypes` — would otherwise be overwritten by this
+   * panel's empty initial state on the first render.
+   *
+   * They are plain `useState` initialisers, so they are read on mount only. Give
+   * the panel a changing `key` if the scope can change while it stays mounted.
+   */
+  initialDirection?: "all" | "debits" | "credits";
+  initialSearch?: string;
+  initialTxnTypes?: string[];
 }
 
 const MetricCard = ({
@@ -75,13 +95,22 @@ export default function DrilldownPanel({
   onPreviewRule,
   onApplyCascade,
   onRefresh,
+  onNoteSave,
+  initialDirection = "all",
+  initialSearch = "",
+  initialTxnTypes = [],
 }: DrilldownPanelProps) {
   // In-view filters layered on top of the period scope
-  const [direction, setDirection] = useState<"all" | "debits" | "credits">("all");
-  const [search, setSearch] = useState("");
-  const [txnTypes, setTxnTypes] = useState<string[]>([]);
+  const [direction, setDirection] = useState<"all" | "debits" | "credits">(initialDirection);
+  const [search, setSearch] = useState(initialSearch);
+  const [txnTypes, setTxnTypes] = useState<string[]>(initialTxnTypes);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
+  // Server-side sort, so a click re-ranks the whole result set rather than the
+  // 50 rows on screen. Sorting resets to page 1, or the user would land on an
+  // out-of-range page that now shows different rows.
+  const [sortBy, setSortBy] = useState("Date");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
 
   const [pendingEdits, setPendingEdits] = useState<PendingEdit[]>([]);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -94,7 +123,19 @@ export default function DrilldownPanel({
   };
 
   const { kpis, isLoading: kpiLoading } = useKPIs(filters);
-  const { transactionsPage, isLoading } = useTransactions(filters, page, pageSize);
+  const { transactionsPage, isLoading } = useTransactions(
+    filters,
+    page,
+    pageSize,
+    sortBy,
+    sortOrder
+  );
+
+  const handleSortChange = (col: string, order: "asc" | "desc") => {
+    setSortBy(col);
+    setSortOrder(order);
+    setPage(1);
+  };
 
   const totalPages = useClampPage(
     page,
@@ -308,41 +349,58 @@ export default function DrilldownPanel({
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
             <thead>
               <tr style={{ borderBottom: "1px solid var(--border-subtle)", textAlign: "left" }}>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "110px" }}>
-                  Date
-                </th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>
-                  Narration
-                </th>
+                <SortableHeader
+                  col="Date"
+                  label="Date"
+                  sortBy={sortBy}
+                  sortOrder={sortOrder}
+                  onSortChange={handleSortChange}
+                />
+                <SortableHeader
+                  col="Narration"
+                  label="Narration"
+                  sortBy={sortBy}
+                  sortOrder={sortOrder}
+                  onSortChange={handleSortChange}
+                />
                 <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600 }}>
                   Type
                 </th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "180px" }}>
-                  Payee / Entity
-                </th>
-                <th
-                  style={{
-                    padding: "10px 12px",
-                    color: "var(--text-muted)",
-                    fontWeight: 600,
-                    textAlign: "right",
-                  }}
-                >
-                  Debit (₹)
-                </th>
-                <th
-                  style={{
-                    padding: "10px 12px",
-                    color: "var(--text-muted)",
-                    fontWeight: 600,
-                    textAlign: "right",
-                  }}
-                >
-                  Credit (₹)
-                </th>
-                <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "180px" }}>
-                  Category
-                </th>
+                <SortableHeader
+                  col="Payee_Receiver"
+                  label="Payee / Entity"
+                  sortBy={sortBy}
+                  sortOrder={sortOrder}
+                  onSortChange={handleSortChange}
+                />
+                <SortableHeader
+                  col="Debit_Amount"
+                  label="Debit (₹)"
+                  align="right"
+                  sortBy={sortBy}
+                  sortOrder={sortOrder}
+                  onSortChange={handleSortChange}
+                />
+                <SortableHeader
+                  col="Credit_Amount"
+                  label="Credit (₹)"
+                  align="right"
+                  sortBy={sortBy}
+                  sortOrder={sortOrder}
+                  onSortChange={handleSortChange}
+                />
+                <SortableHeader
+                  col="Broad_Category"
+                  label="Category"
+                  sortBy={sortBy}
+                  sortOrder={sortOrder}
+                  onSortChange={handleSortChange}
+                />
+                {onNoteSave ? (
+                  <th style={{ padding: "10px 12px", color: "var(--text-muted)", fontWeight: 600, width: "200px" }}>
+                    Note
+                  </th>
+                ) : null}
               </tr>
             </thead>
             <tbody>
@@ -425,6 +483,16 @@ export default function DrilldownPanel({
                       ))}
                     </select>
                   </td>
+                  {/* The same NoteCell the explorer table uses. A drill-down is
+                      where a category gets triaged row by row, so it is exactly
+                      where a note is most likely to be wanted — and a note the
+                      panel could not be written in would look like a read-only
+                      view of something that is not. */}
+                  {onNoteSave ? (
+                    <td style={{ padding: "10px 12px", maxWidth: "200px" }}>
+                      <NoteCell row={row} onSave={onNoteSave} />
+                    </td>
+                  ) : null}
                 </tr>
               ))}
             </tbody>

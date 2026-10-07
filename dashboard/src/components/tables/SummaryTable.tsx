@@ -20,7 +20,7 @@ export default function SummaryTable({
   if (!data || data.length === 0) return null;
 
   return (
-    <div className="glass-panel" style={{ padding: "20px", marginTop: "24px" }}>
+    <div className="glass-panel" style={{ padding: "20px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
         <div>
           <h3 style={{ fontSize: "1.1rem", fontWeight: 700, color: "var(--text-primary)" }}>

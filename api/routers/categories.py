@@ -21,6 +21,9 @@ from db import (
     apply_category_rules,
     delete_category_rules,
     get_all_transactions_with_details,
+    get_category_definitions,
+    upsert_category_definition,
+    delete_category_definition,
 )
 
 router = APIRouter(prefix="/categories", tags=["categories"])
@@ -123,6 +126,70 @@ def list_custom_categories(engine: Engine = Depends(get_engine)):
 @router.get("/sub")
 def list_sub_categories(engine: Engine = Depends(get_engine)):
     return get_sub_categories(engine)
+
+
+# ---------------------------------------------------------------------------
+# Category definitions — what each category is for
+#
+# Declared above the `/{name}` routes on purpose. FastAPI matches in declaration
+# order, and `DELETE /{name}` would otherwise swallow `DELETE /definitions/...`.
+# ---------------------------------------------------------------------------
+
+@router.get("/definitions")
+def list_definitions(engine: Engine = Depends(get_engine)):
+    """
+    Every category with its description, examples and resolved direction.
+
+    `direction` is the effective one (the user's override, or the code default);
+    `code_direction` is the default on its own. Both are returned because a user
+    who has overridden a direction needs to see what the override is relative to,
+    and a "reset to default" control cannot be built without it.
+    """
+    return {"definitions": get_category_definitions(engine)}
+
+
+class DefinitionRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    examples: Optional[str] = None
+    # null clears the override and returns the category to its code direction.
+    direction_override: Optional[str] = None
+
+
+@router.post("/definitions")
+def upsert_definition(body: DefinitionRequest, engine: Engine = Depends(get_engine)):
+    """
+    Creates or updates a definition, registering the category if it is new.
+
+    Registering on write is deliberate: defining a category and using one are the
+    same act from the user's point of view, and a definition for a name no
+    dropdown offers is a note to self.
+    """
+    try:
+        definitions = upsert_category_definition(
+            engine,
+            body.name,
+            description=(body.description or "").strip() or None,
+            examples=(body.examples or "").strip() or None,
+            direction_override=body.direction_override,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"success": True, "definitions": definitions}
+
+
+@router.delete("/definitions/{name}")
+def remove_definition(name: str, engine: Engine = Depends(get_engine)):
+    """
+    Removes one definition. The category stays registered and usable.
+
+    Only the definition goes: the name is still referenced by rules and stored rows,
+    and dropping the registry entry would break every dropdown listing it. A
+    built-in's definition is re-seeded on the next start, which is correct — a
+    code-owned definition should not be permanently deletable.
+    """
+    deleted = delete_category_definition(engine, name)
+    return {"success": True, "deleted": name, "removed": deleted}
 
 
 # ---------------------------------------------------------------------------

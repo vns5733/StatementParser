@@ -26,6 +26,7 @@ export function buildFilterParams(filters: Partial<Filters>): Record<string, str
   if (filters.subCategories?.length) params.sub_categories = filters.subCategories.join(",");
   if (filters.accountSources?.length) params.account_sources = filters.accountSources.join(",");
   if (filters.cardIds?.length) params.card_ids = filters.cardIds.join(",");
+  if (filters.payee?.length) params.payee = filters.payee.join(",");
   if (filters.isRecurring === true) params.is_recurring = "true";
   else if (filters.isRecurring === false) params.is_recurring = "false";
   if (filters.direction && filters.direction !== "all") params.direction = filters.direction;
@@ -37,6 +38,13 @@ export function buildFilterParams(filters: Partial<Filters>): Record<string, str
     params.amount_max = String(filters.amountMax);
   if (filters.yearMonths?.length) params.year_months = filters.yearMonths.join(",");
   if (filters.spendBasis && filters.spendBasis !== "all") params.spend_basis = filters.spendBasis;
+  // Tri-state: absent means "both", which must send nothing at all rather than
+  // "false" - the server would read false as "only unflagged rows" and the user
+  // would be left wondering where the 64 flagged refunds went.
+  if (filters.directionMismatch === true) params.direction_mismatch = "true";
+  else if (filters.directionMismatch === false) params.direction_mismatch = "false";
+  if (filters.hasNote === true) params.has_note = "true";
+  else if (filters.hasNote === false) params.has_note = "false";
   return params;
 }
 

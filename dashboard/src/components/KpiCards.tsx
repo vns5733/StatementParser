@@ -21,95 +21,44 @@ export default function KpiCards({ kpis, isLoading }: KpiCardsProps) {
   const settlements =
     Math.abs(kpis?.settlement_debits ?? 0) + Math.abs(kpis?.settlement_credits ?? 0);
   // True when these tiles excluded them, which the category charts always do.
-  const settlementsHidden =
-    settlements > 0 && (kpis?.settlement_count ?? 0) === 0;
+  const settlementsHidden = settlements > 0 && (kpis?.settlement_count ?? 0) === 0;
   const count = kpis?.filtered_count ?? 0;
   const totalCount = kpis?.total_count ?? 0;
+  const netColor = net >= 0 ? "var(--emerald-inflow)" : "var(--rose-outflow)";
 
   return (
-    <div style={{
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-      gap: "16px",
-      marginBottom: "24px"
-    }}>
-      {/* Total Credits */}
-      <div className="glass-panel" style={{
-        padding: "20px",
-        position: "relative",
-        overflow: "hidden",
-        borderTop: "3px solid var(--emerald-inflow)"
-      }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "8px" }}>
-          <span style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Total Credits (Inflow)
-          </span>
-          <span style={{
-            background: "rgba(16, 185, 129, 0.15)",
-            color: "var(--emerald-inflow)",
-            borderRadius: "50%",
-            width: "32px",
-            height: "32px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: "1rem"
-          }}>
+    <div className="kpi-grid">
+      <div className="glass-panel kpi-tile" style={{ borderTopColor: "var(--emerald-inflow)" }}>
+        <div className="kpi-head">
+          <span className="kpi-label">Total Credits (Inflow)</span>
+          <span className="kpi-icon" style={{ background: "rgba(16, 185, 129, 0.15)", color: "var(--emerald-inflow)" }}>
             ↓
           </span>
         </div>
-        <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "var(--emerald-inflow)", letterSpacing: "-0.02em" }}>
+        <div className="kpi-value text-inflow">
           {isLoading ? "..." : formatCurrency(credits)}
         </div>
-        <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "4px" }}>
-          Total deposits & income inflows
-        </div>
+        <div className="kpi-note">Total deposits &amp; income inflows</div>
       </div>
 
-      {/* Total Debits */}
-      <div className="glass-panel" style={{
-        padding: "20px",
-        position: "relative",
-        overflow: "hidden",
-        borderTop: "3px solid var(--rose-outflow)"
-      }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "8px" }}>
-          <span style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Total Debits (Outflow)
-          </span>
-          <span style={{
-            background: "rgba(244, 63, 94, 0.15)",
-            color: "var(--rose-outflow)",
-            borderRadius: "50%",
-            width: "32px",
-            height: "32px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: "1rem"
-          }}>
+      <div className="glass-panel kpi-tile" style={{ borderTopColor: "var(--rose-outflow)" }}>
+        <div className="kpi-head">
+          <span className="kpi-label">Total Debits (Outflow)</span>
+          <span className="kpi-icon" style={{ background: "rgba(244, 63, 94, 0.15)", color: "var(--rose-outflow)" }}>
             ↑
           </span>
         </div>
-        <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "var(--rose-outflow)", letterSpacing: "-0.02em" }}>
+        <div className="kpi-value text-outflow">
           {isLoading ? "..." : formatCurrency(debits)}
         </div>
-        <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "4px" }}>
-          Withdrawals, expenses & card bill payments
-        </div>
+        <div className="kpi-note">Withdrawals, expenses &amp; card bill payments</div>
         {/* In the combined view the card payment's two halves are both present,
             so they are left out of the tiles (and out of the category charts) to
             avoid counting the same purchase twice. Scoped to one ledger only one
             half exists, so it is counted above and no note is needed. */}
         {settlementsHidden && (
           <div
-            style={{
-              fontSize: "0.7rem",
-              color: "var(--text-muted)",
-              marginTop: "6px",
-              paddingTop: "6px",
-              borderTop: "1px solid rgba(255,255,255,0.08)",
-            }}
+            className="kpi-excluded"
             title="Card bill payments are a transfer between your bank and the card. Both halves are in this view, so they are excluded from the totals and from the category charts to avoid counting the purchase twice."
           >
             excl. {formatCurrency(settlements)} card bill payments
@@ -117,73 +66,38 @@ export default function KpiCards({ kpis, isLoading }: KpiCardsProps) {
         )}
       </div>
 
-      {/* Net Cash Flow */}
-      <div className="glass-panel" style={{
-        padding: "20px",
-        position: "relative",
-        overflow: "hidden",
-        borderTop: `3px solid ${net >= 0 ? "var(--emerald-inflow)" : "var(--rose-outflow)"}`
-      }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "8px" }}>
-          <span style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Net Cash Flow
-          </span>
-          <span style={{
-            background: net >= 0 ? "rgba(16, 185, 129, 0.15)" : "rgba(244, 63, 94, 0.15)",
-            color: net >= 0 ? "var(--emerald-inflow)" : "var(--rose-outflow)",
-            borderRadius: "50%",
-            width: "32px",
-            height: "32px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: "1rem"
-          }}>
+      <div className="glass-panel kpi-tile" style={{ borderTopColor: netColor }}>
+        <div className="kpi-head">
+          <span className="kpi-label">Net Cash Flow</span>
+          <span
+            className="kpi-icon"
+            style={{
+              background: net >= 0 ? "rgba(16, 185, 129, 0.15)" : "rgba(244, 63, 94, 0.15)",
+              color: netColor,
+            }}
+          >
             {net >= 0 ? "▲" : "▼"}
           </span>
         </div>
-        <div style={{
-          fontSize: "1.75rem",
-          fontWeight: 700,
-          color: net >= 0 ? "var(--emerald-inflow)" : "var(--rose-outflow)",
-          letterSpacing: "-0.02em"
-        }}>
+        <div className="kpi-value" style={{ color: netColor }}>
           {isLoading ? "..." : formatCurrency(net)}
         </div>
-        <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "4px" }}>
+        <div className="kpi-note">
           {net >= 0 ? "Net surplus for selected range" : "Net deficit for selected range"}
         </div>
       </div>
 
-      {/* Transaction Count */}
-      <div className="glass-panel" style={{
-        padding: "20px",
-        position: "relative",
-        overflow: "hidden",
-        borderTop: "3px solid var(--accent-indigo)"
-      }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "8px" }}>
-          <span style={{ fontSize: "0.825rem", fontWeight: 600, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            Transactions Found
-          </span>
-          <span style={{
-            background: "rgba(99, 102, 241, 0.15)",
-            color: "var(--accent-indigo)",
-            borderRadius: "50%",
-            width: "32px",
-            height: "32px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            fontSize: "1rem"
-          }}>
+      <div className="glass-panel kpi-tile" style={{ borderTopColor: "var(--accent-indigo)" }}>
+        <div className="kpi-head">
+          <span className="kpi-label">Transactions Found</span>
+          <span className="kpi-icon" style={{ background: "rgba(99, 102, 241, 0.15)", color: "var(--accent-indigo)" }}>
             📄
           </span>
         </div>
-        <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "var(--text-primary)", letterSpacing: "-0.02em" }}>
+        <div className="kpi-value text-primary">
           {isLoading ? "..." : formatNumber(count)}
         </div>
-        <div style={{ fontSize: "0.75rem", color: "var(--text-muted)", marginTop: "4px" }}>
+        <div className="kpi-note">
           {formatNumber(count)} of {formatNumber(totalCount)} total stored
         </div>
       </div>
